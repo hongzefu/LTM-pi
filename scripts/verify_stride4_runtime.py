@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -378,6 +379,25 @@ def compare_memory(element: dict, reference, segments, mean, std) -> dict:
     return numeric_parity(actual[mask], reference, mean, std)
 
 
+def verify_wrong_contract_rejected(checkpoint: Path, config, manifest_path: Path, validator) -> int:
+    """交换现有anchor类型编号，保持词表与参数形状；只认模型身份拒绝。"""
+    demo_id = config.model.memory_demo_anchor_type_id
+    execution_id = config.model.memory_execution_anchor_type_id
+    require(demo_id != execution_id, "无法构造不同的anchor类型配置")
+    wrong_model = dataclasses.replace(
+        config.model,
+        memory_demo_anchor_type_id=execution_id,
+        memory_execution_anchor_type_id=demo_id,
+    )
+    wrong_config = dataclasses.replace(config, model=wrong_model)
+    try:
+        validator(checkpoint, wrong_config, manifest_path=manifest_path)
+    except ValueError as error:
+        require("model_config_sha256" in str(error), f"错误配置并非因模型合同身份被拒绝：{error}")
+        return 1
+    raise ValueError("同形状的错误anchor配置未被保存件合同拒绝")
+
+
 def online_check(env_file: Path, checkpoint: Path, pair_batch_size: int) -> dict:
     import jax
     import jax.numpy as jnp
@@ -396,6 +416,9 @@ def online_check(env_file: Path, checkpoint: Path, pair_batch_size: int) -> dict
     manifest_path = Path(os.environ["ROBOMME_MEMORY_CACHE"]) / "manifest.json"
     _checkpoint_is_committed(checkpoint)
     contract = ltmpi_contract.validate_checkpoint_contract(checkpoint, config, manifest_path=manifest_path)
+    wrong_contract_rejected = verify_wrong_contract_rejected(
+        checkpoint, config, manifest_path, ltmpi_contract.validate_checkpoint_contract
+    )
     source_identity = ltmpi_contract.validate_source_input_manifest(
         Path(os.environ["ROBOMME_INPUT_MANIFEST"]), Path(config.data.repo_id)
     )
@@ -591,6 +614,7 @@ def online_check(env_file: Path, checkpoint: Path, pair_batch_size: int) -> dict
         "episode_index": source.episode_index,
         "policy_loaded": True,
         "dreamdojo_loaded": True,
+        "wrong_contract_rejected": wrong_contract_rejected,
         "actions_shape": list(actions.shape),
         "action_sha256": hashlib.sha256(actions.tobytes()).hexdigest(),
         "boundary_residues": [0, 1, 2, 3],
@@ -824,12 +848,18 @@ def main() -> int:
                 write_json(report_path, report)
                 if args.mode == "smoke":
                     report["stages"]["online"] = invoke("online", resume_env, checkpoint_root / "21")
-                    print("S4_ONLINE_OFFLINE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1", flush=True)
+                    print(
+                        "S4_ONLINE_OFFLINE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1 wrong_contract_rejected=1",
+                        flush=True,
+                    )
         else:
             require(args.checkpoint is not None, "online/restore必须指定--checkpoint")
             report["stages"]["checkpoint"] = invoke("checkpoint", args.env_file, args.checkpoint.resolve())
             report["stages"]["online"] = invoke("online", args.env_file, args.checkpoint.resolve())
-            print("LTMPI_S4_RESTORE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1", flush=True)
+            print(
+                "LTMPI_S4_RESTORE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1 wrong_contract_rejected=1",
+                flush=True,
+            )
         report["status"] = "pass"
         write_json(report_path, report)
         print(f"LTMPI_S4_RUNTIME=PASS mode={args.mode} report={report_path}", flush=True)

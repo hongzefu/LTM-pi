@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -32,6 +33,56 @@ class RuntimeTest(unittest.TestCase):
             }
             for step in range(first, stop)
         ]
+
+    def contract_config(self):
+        @dataclasses.dataclass(frozen=True)
+        class Model:
+            memory_demo_anchor_type_id: int = 4
+            memory_execution_anchor_type_id: int = 5
+            memory_segment_vocab_size: int = 6
+            memory_anchor_pool_grid: int = 4
+
+        @dataclasses.dataclass(frozen=True)
+        class Config:
+            model: Model
+            name: str = runtime.CONFIG
+
+        return Config(Model())
+
+    def test_wrong_contract_mutates_only_existing_anchor_ids_and_requires_rejection(self):
+        config = self.contract_config()
+        checkpoint, manifest = self.root / "21", self.root / "manifest.json"
+
+        def validator(actual_checkpoint, candidate, *, manifest_path):
+            self.assertEqual(actual_checkpoint, checkpoint)
+            self.assertEqual(manifest_path, manifest)
+            self.assertEqual(candidate.name, config.name)
+            differences = {
+                key
+                for key, value in dataclasses.asdict(config.model).items()
+                if dataclasses.asdict(candidate.model)[key] != value
+            }
+            self.assertEqual(differences, {"memory_demo_anchor_type_id", "memory_execution_anchor_type_id"})
+            self.assertEqual(candidate.model.memory_demo_anchor_type_id, 5)
+            self.assertEqual(candidate.model.memory_execution_anchor_type_id, 4)
+            raise ValueError("checkpoint 合同身份不符：model_config_sha256")
+
+        self.assertEqual(runtime.verify_wrong_contract_rejected(checkpoint, config, manifest, validator), 1)
+        self.assertEqual(config.model.memory_demo_anchor_type_id, 4)
+        self.assertEqual(config.model.memory_execution_anchor_type_id, 5)
+
+    def test_accepting_wrong_contract_is_fatal(self):
+        with self.assertRaisesRegex(ValueError, "未被保存件合同拒绝"):
+            runtime.verify_wrong_contract_rejected(
+                self.root / "21", self.contract_config(), self.root / "manifest.json", mock.Mock(return_value={})
+            )
+
+    def test_missing_assets_cannot_count_as_wrong_contract_rejection(self):
+        for error in (FileNotFoundError("缺少保存件"), ValueError("checkpoint 尚未完整提交")):
+            with self.subTest(error=str(error)), self.assertRaises(type(error)):
+                runtime.verify_wrong_contract_rejected(
+                    self.root / "21", self.contract_config(), self.root / "manifest.json", mock.Mock(side_effect=error)
+                )
 
     def test_all_updates_and_resume_are_required(self):
         result = runtime.verify_train_rows(self.rows(), 0, 20)
