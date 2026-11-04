@@ -357,7 +357,7 @@ class ServerCheckpointContractTest(unittest.TestCase):
         self.contract_path = self.checkpoint / "assets" / "training_contract.json"
         ltmpi_contract.write_json_atomic(self.contract_path, self.contract)
 
-    def _preflight(self, config):
+    def _preflight(self, config, *, identity=None):
         from openpi.training import config as training_config
 
         argv = [
@@ -372,7 +372,8 @@ class ServerCheckpointContractTest(unittest.TestCase):
             config.name,
             "--preflight-only",
         ]
-        identity = SimpleNamespace(format=serve.EXPECTED_CHECKPOINT_FORMAT, sha256=serve.EXPECTED_ENCODER_SHA256)
+        if identity is None:
+            identity = SimpleNamespace(format=serve.EXPECTED_CHECKPOINT_FORMAT, sha256=serve.EXPECTED_ENCODER_SHA256)
         output = io.StringIO()
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch("sys.argv", argv))
@@ -399,6 +400,22 @@ class ServerCheckpointContractTest(unittest.TestCase):
         self.contract_path.unlink()
         with self.assertRaises((ValueError, FileNotFoundError)):
             self._preflight(self.config)
+
+    def test_contract_rejects_legacy_encoder_despite_release_whitelist(self):
+        identity = SimpleNamespace(format=serve.LEGACY_CHECKPOINT_FORMAT, sha256=serve.LEGACY_ENCODER_SHA256)
+        with self.assertRaisesRegex(ValueError, "运行时编码器"):
+            self._preflight(self.config, identity=identity)
+
+    def test_contract_requires_encoder_to_match_config_metadata(self):
+        config = dataclasses.replace(
+            self.config,
+            policy_metadata={
+                **self.config.policy_metadata,
+                "memory_encoder_checkpoint_sha256": serve.LEGACY_ENCODER_SHA256,
+            },
+        )
+        with self.assertRaisesRegex(ValueError, "运行时编码器"):
+            self._preflight(config)
 
     def test_same_shape_wrong_semantics_and_old_config_name_cannot_bypass_contract(self):
         # 类型编号不改变参数形状，仍须按模型语义拒绝；改回旧名字也不能跳过合同。
@@ -427,11 +444,16 @@ class ServerCheckpointContractTest(unittest.TestCase):
 
         self.contract_path.unlink()
         self.manifest_path.write_text(json.dumps(Stride4ConfigurationTest._manifest(1)))
-        result = self._preflight(training_config.get_config(serve.DEFAULT_CONFIG))
-        self.assertFalse(result["training_contract_verified"])
-        self.assertFalse(result["models_loaded"])
-        self.assertEqual(result["memory_lag"], 10)
-        self.assertEqual(result["transition_frame_stride"], 1)
+        for format_name, sha256 in serve.COMPATIBLE_ENCODER_IDENTITIES:
+            with self.subTest(encoder_sha256=sha256):
+                result = self._preflight(
+                    training_config.get_config(serve.DEFAULT_CONFIG),
+                    identity=SimpleNamespace(format=format_name, sha256=sha256),
+                )
+                self.assertFalse(result["training_contract_verified"])
+                self.assertFalse(result["models_loaded"])
+                self.assertEqual(result["memory_lag"], 10)
+                self.assertEqual(result["transition_frame_stride"], 1)
 
 
 if __name__ == "__main__":

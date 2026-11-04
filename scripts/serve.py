@@ -609,6 +609,15 @@ def main() -> None:
     encoder_key = (encoder_identity.format, encoder_identity.sha256)
     if encoder_key not in COMPATIBLE_ENCODER_IDENTITIES:
         raise ValueError(f"Unsupported DreamDojo encoder identity: {encoder_key}")
+    if training_contract is not None or config.name == STRIDE4_CONFIG:
+        # 新合同绑定具体编码器，不能借旧发行版的兼容白名单换用另一份权重。
+        manifest_encoder_key = (manifest["checkpoint_format"], manifest["checkpoint_sha256"])
+        config_encoder_sha256 = config.policy_metadata["memory_encoder_checkpoint_sha256"]
+        if encoder_key != manifest_encoder_key or encoder_identity.sha256 != config_encoder_sha256:
+            raise ValueError(
+                "运行时编码器与训练合同绑定的清单或配置不一致："
+                f"runtime={encoder_key}, manifest={manifest_encoder_key}, config_sha256={config_encoder_sha256}"
+            )
     preflight = {
         "status": "ok",
         "checkpoint": str(checkpoint),
