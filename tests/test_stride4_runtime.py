@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import dataclasses
 import io
 import json
@@ -10,6 +11,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -48,6 +50,235 @@ class RuntimeTest(unittest.TestCase):
             name: str = runtime.CONFIG
 
         return Config(Model())
+
+    def frozen_audit(self, config_name="frozen-fixture"):
+        vision = {"sha256": "a" * 64, "leaf_count": 2, "parameter_count": 32, "dtypes": ["bfloat16"]}
+        initial = {
+            "step": 0,
+            "live_vision": vision,
+            "ema_vision": copy.deepcopy(vision),
+            "optimizer_vision_numeric_paths": [],
+            "optimizer_counts": {"adam/count": 0},
+            "nonvision_probes": {"PaliGemma/llm/w": "b" * 64},
+        }
+        final = copy.deepcopy(initial)
+        final.update(step=20, optimizer_counts={"adam/count": 20}, nonvision_probes={"PaliGemma/llm/w": "c" * 64})
+        return {
+            "schema_version": 1,
+            "kind": "ltmpi_frozen_siglip_audit",
+            "status": "PASS",
+            "config_name": config_name,
+            "contract_sha256": "fixture",
+            "expected_steps": 20,
+            "metrics_count": 20,
+            "initial": initial,
+            "final": final,
+            "checks": {
+                key: True
+                for key in (
+                    "vision_unchanged",
+                    "ema_vision_unchanged",
+                    "vision_bfloat16",
+                    "optimizer_vision_empty",
+                    "nonvision_updated",
+                    "optimizer_counts_match_step",
+                    "completed_expected_steps",
+                    "metrics_finite",
+                )
+            },
+        }
+
+    def write_checkpoint_files(self, checkpoint, contract):
+        for name in ("params", "train_state"):
+            (checkpoint / name).mkdir(parents=True)
+            for filename in ("_METADATA", "manifest.ocdbt"):
+                (checkpoint / name / filename).write_text("fixture")
+            for folder in ("d", "ocdbt.process_0/d"):
+                directory = checkpoint / name / folder
+                directory.mkdir(parents=True)
+                (directory / "fixture").write_bytes(b"payload")
+        (checkpoint / "assets").mkdir()
+        (checkpoint / "assets" / "norm_stats.json").write_text("{}")
+        (checkpoint / "assets" / "training_contract.json").write_bytes(contract.read_bytes())
+        runtime.write_json(checkpoint / "_CHECKPOINT_METADATA", {"commit_timestamp_nsecs": 1})
+
+    def frozen_environment(self):
+        from openpi.shared.ltmpi_contract import FROZEN_S4_CONFIG_NAME
+
+        dataset, memory, anchors = (self.root / name for name in ("dataset", "memory", "anchors"))
+        for path in (dataset, memory, anchors):
+            path.mkdir()
+        manifest = {
+            "status": "complete",
+            "dataset_root": str(dataset),
+            "source_input_pin": "fixture",
+            "transition_frame_stride": 4,
+            "latent_dim": 64,
+            "cached_total_frames": 482,
+        }
+        anchor_manifest = {key: manifest[key] for key in ("status", "dataset_root", "source_input_pin")}
+        for root, item, keys in (
+            (memory, manifest, ("global_latents", "global_frame_index")),
+            (
+                anchors,
+                anchor_manifest,
+                ("images_file", "execution_images_file", "episode_to_anchor_file", "exec_start_idx_file"),
+            ),
+        ):
+            for key in keys:
+                path = root / (key + ".bin")
+                path.write_bytes(b"cache-fixture")
+                item[key] = path.name
+                item[key.removesuffix("_file") + "_sha256"] = runtime.sha256(path)
+            runtime.write_json(root / "manifest.json", item)
+        contract = self.root / "training_contract.json"
+        runtime.write_json(contract, {"contract_sha256": "fixture"})
+        return {
+            **os.environ,
+            "ROBOMME_CONFIG": FROZEN_S4_CONFIG_NAME,
+            "ROBOMME_EXP": "frozen-cpu-smoke-fixture",
+            "RUN_BASE_DIR": str(self.root / "logs"),
+            "CHECKPOINT_BASE_DIR": str(self.root / "checkpoints"),
+            "ROBOMME_MEMORY_CACHE": str(memory),
+            "ROBOMME_ANCHOR_CACHE": str(anchors),
+            "ROBOMME_VIDEO_DATASET": str(dataset),
+            "ROBOMME_NUM_TRAIN_STEPS": "60000",
+            "ROBOMME_UPLOAD_RECEIPTS_DIR": "",
+            "HF_CACHE": str(self.root / "hf"),
+            "ROBOMME_TRAINING_CONTRACT": str(contract),
+        }
+
+    def test_frozen_audit_requires_evidence_even_when_checks_claim_pass(self):
+        path = self.root / "audit.json"
+        good = self.frozen_audit()
+        runtime.write_json(path, good)
+        self.assertEqual(runtime.verify_frozen_audit(path, "frozen-fixture", "fixture"), good)
+        variants = []
+        for key, value in (
+            ("status", "INITIALIZED"),
+            ("metrics_count", 19),
+            ("config_name", "wrong"),
+            ("contract_sha256", "wrong"),
+        ):
+            bad = copy.deepcopy(good)
+            bad[key] = value
+            variants.append(bad)
+        for key, value in (
+            ("live_vision", {**good["final"]["live_vision"], "sha256": "d" * 64}),
+            ("ema_vision", {**good["final"]["ema_vision"], "dtypes": ["float32"]}),
+            ("optimizer_vision_numeric_paths", ["opt_state/PaliGemma/img/w"]),
+            ("optimizer_counts", {"adam/count": 19}),
+            ("nonvision_probes", good["initial"]["nonvision_probes"]),
+        ):
+            bad = copy.deepcopy(good)
+            bad["final"][key] = value
+            variants.append(bad)
+        for bad in variants:
+            runtime.write_json(path, bad)
+            with self.subTest(audit=bad), self.assertRaises(ValueError):
+                runtime.verify_frozen_audit(path, "frozen-fixture", "fixture")
+
+    def test_frozen_checkpoint_files_only_require_complete_committed_parts(self):
+        contract = self.root / "contract.json"
+        contract.write_text("{}")
+        checkpoint = self.root / "20"
+        self.write_checkpoint_files(checkpoint, contract)
+        with mock.patch.object(runtime, "checkpoint_counters", side_effect=AssertionError("禁止恢复")):
+            result = runtime.committed_checkpoint_files(checkpoint, contract)
+        self.assertEqual(result["step"], 20)
+        self.assertEqual(result["verification"], "committed_metadata_and_files_only")
+        self.assertGreater(result["complete_checkpoint_bytes"], 0)
+        shard = checkpoint / "train_state" / "ocdbt.process_0" / "d" / "fixture"
+        shard.unlink()
+        with self.assertRaisesRegex(ValueError, "OCDBT数据文件"):
+            runtime.committed_checkpoint_files(checkpoint, contract)
+        shard.write_bytes(b"payload")
+        (checkpoint / "train_state" / "manifest.ocdbt").unlink()
+        with self.assertRaisesRegex(ValueError, "保存件缺少"):
+            runtime.committed_checkpoint_files(checkpoint, contract)
+
+    def test_frozen_existing_cache_must_match_hash_without_rebuild(self):
+        env = self.frozen_environment()
+        result = runtime.existing_frozen_cache(env)
+        self.assertEqual(result["mode"], "reuse_read_only")
+        (Path(env["ROBOMME_MEMORY_CACHE"]) / "global_latents.bin").write_bytes(b"modified")
+        with self.assertRaisesRegex(ValueError, "文件身份不符"):
+            runtime.existing_frozen_cache(env)
+
+    def test_frozen_mode_runs_one_train_command_and_records_skipped_stages(self):
+        env = self.frozen_environment()
+        output = self.root / "results"
+        source = self.root / "source.env"
+        source.write_text("ROBOMME_NUM_TRAIN_STEPS=60000\n")
+        checkpoint = Path(env["CHECKPOINT_BASE_DIR"]) / env["ROBOMME_CONFIG"] / env["ROBOMME_EXP"] / "20"
+        calls = []
+
+        def command(argv, **kwargs):
+            calls.append(argv)
+            self.assertEqual(argv, ["bash", "bin/train.sh", "run"])
+            child = kwargs["env"]
+            for key, value in (
+                ("ROBOMME_NUM_TRAIN_STEPS", "20"),
+                ("ROBOMME_SAVE_STEPS", "20"),
+                ("ROBOMME_RESUME", "0"),
+                ("ROBOMME_LR_DECAY_STEPS", "60000"),
+            ):
+                self.assertEqual(child[key], value)
+            self.assertEqual(child["JAX_PLATFORMS"], "cuda")
+            runtime.write_json(Path(child["LTMPI_FROZEN_AUDIT_REPORT"]), self.frozen_audit(env["ROBOMME_CONFIG"]))
+            self.write_checkpoint_files(checkpoint, Path(env["ROBOMME_TRAINING_CONTRACT"]))
+            return {
+                "rows": self.rows(),
+                "peak_sampled_bytes": {
+                    "checkpoint": runtime.directory_bytes(checkpoint),
+                    "hf_cache": 0,
+                    "arrow_cache": 32,
+                },
+            }
+
+        def config(env_file, **kwargs):
+            self.assertEqual(os.environ["JAX_PLATFORMS"], "cpu")
+            self.assertEqual(os.environ["CUDA_VISIBLE_DEVICES"], "")
+            self.assertEqual(kwargs["command_env"]["ROBOMME_NUM_TRAIN_STEPS"], "20")
+            return SimpleNamespace(num_train_steps=20, resume=False, save_steps=(20,), log_interval=1)
+
+        argv = ["verify", "--env-file", str(source), "--mode", "frozen-train-smoke", "--output-dir", str(output)]
+        with (
+            mock.patch.object(runtime, "read_env", return_value=env),
+            mock.patch.object(runtime, "require_clean_fork"),
+            mock.patch.object(runtime, "effective_config", side_effect=config),
+            mock.patch.object(runtime, "run_command", side_effect=command),
+            mock.patch.object(runtime, "checkpoint_counters", side_effect=AssertionError("禁止恢复")),
+            mock.patch.object(runtime, "online_check", side_effect=AssertionError("禁止在线验证")),
+            mock.patch.object(runtime.sys, "argv", argv),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(runtime.main(), 0)
+        self.assertEqual(len(calls), 1)
+        resources = json.loads((output / "resources.json").read_text())
+        self.assertEqual(resources["completed_step"], 20)
+        self.assertEqual(resources["updates"], 20)
+        self.assertNotIn("resumed_to", resources)
+        self.assertEqual(resources["resume_test"], "skipped_user_authorized")
+        self.assertEqual(resources["restore_test"], "skipped_user_authorized")
+        self.assertEqual(resources["independent_restore_copy_purpose"], "remote_readback_budget_only")
+        self.assertEqual(resources["freeze_audit"]["status"], "PASS")
+        self.assertFalse((output / "resume21.log").exists())
+
+    def test_frozen_config_cannot_enter_legacy_workers(self):
+        env = self.frozen_environment()
+        for args in (("--mode", "restore"), ("--worker", "checkpoint"), ("--mode", "smoke")):
+            with (
+                mock.patch.object(runtime, "read_env", return_value=env),
+                mock.patch.object(runtime.sys, "argv", ["verify", "--env-file", "fixture", *args]),
+            ):
+                with self.assertRaisesRegex(ValueError, "不执行恢复或在线worker"):
+                    runtime.main()
+
+    def test_frozen_requires_clean_producer_fork(self):
+        with mock.patch.object(runtime.subprocess, "check_output", return_value=" M scripts/train.py\n"):
+            with self.assertRaisesRegex(ValueError, "clean fork"):
+                runtime.require_clean_fork()
 
     def test_wrong_contract_mutates_only_existing_anchor_ids_and_requires_rejection(self):
         config = self.contract_config()

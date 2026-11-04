@@ -21,17 +21,19 @@ from typing import Any
 
 import numpy as np
 
-_RUNTIME_ROOT = next(
-    parent for parent in Path(__file__).resolve().parents if (parent / "src" / "openpi").is_dir()
-)
+_RUNTIME_ROOT = next(parent for parent in Path(__file__).resolve().parents if (parent / "src" / "openpi").is_dir())
 for _path in (str(_RUNTIME_ROOT), str(_RUNTIME_ROOT / "src")):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
 
+# 直接执行脚本时，须先加入本执行副本的源码路径。
+from openpi.shared.ltmpi_contract import FROZEN_S4_CONFIG_NAME, S4_CONFIG_NAME, S4_CONFIG_NAMES  # noqa: E402
+
 DEFAULT_CONFIG = "pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default"
-STRIDE4_CONFIG = "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default"
-SUPPORTED_CONFIGS = frozenset((DEFAULT_CONFIG, STRIDE4_CONFIG))
+STRIDE4_CONFIG = S4_CONFIG_NAME
+FROZEN_STRIDE4_CONFIG = FROZEN_S4_CONFIG_NAME
+SUPPORTED_CONFIGS = frozenset((DEFAULT_CONFIG, *S4_CONFIG_NAMES))
 DEFAULT_DREAMDOJO_RUNTIME_ROOT = _RUNTIME_ROOT / "third_party" / "dreamdojo" / "runtime"
 EXPECTED_ENCODER_SHA256 = "d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f"
 EXPECTED_CHECKPOINT_FORMAT = "dreamdojo.lightning"
@@ -609,7 +611,7 @@ def main() -> None:
     encoder_key = (encoder_identity.format, encoder_identity.sha256)
     if encoder_key not in COMPATIBLE_ENCODER_IDENTITIES:
         raise ValueError(f"Unsupported DreamDojo encoder identity: {encoder_key}")
-    if training_contract is not None or config.name == STRIDE4_CONFIG:
+    if training_contract is not None or config.name in S4_CONFIG_NAMES:
         # 新合同绑定具体编码器，不能借旧发行版的兼容白名单换用另一份权重。
         manifest_encoder_key = (manifest["checkpoint_format"], manifest["checkpoint_sha256"])
         config_encoder_sha256 = config.policy_metadata["memory_encoder_checkpoint_sha256"]
