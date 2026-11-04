@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""真实执行stride4缓存、20→21恢复及在线对拍；未执行的阶段绝不记为通过。"""
+"""验证stride4运行；冻结模式仅执行20步，恢复与在线阶段按用户授权跳过。"""
 
 from __future__ import annotations
 
@@ -83,6 +83,11 @@ def sha256(path: Path) -> str:
         while block := stream.read(8 * 1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
+
+
+def require_clean_fork() -> None:
+    status = subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=ROOT, text=True)
+    require(not status.strip(), "冻结短测必须从clean fork执行，避免资源报告身份与实际源码不符")
 
 
 def run_command(
@@ -215,19 +220,19 @@ def numeric_parity(
     }
 
 
-def effective_config(env_file: Path):
+def effective_config(env_file: Path, *, expected_config: str = CONFIG, command_env: dict[str, str] | None = None):
     from openpi.training import config as configs
 
     result = subprocess.run(
         ["bash", "bin/train.sh", "print-args"],
         cwd=ROOT,
-        env={**os.environ, "ROBOMME_ENV_FILE": str(env_file)},
+        env={**(os.environ if command_env is None else command_env), "ROBOMME_ENV_FILE": str(env_file)},
         check=True,
         stdout=subprocess.PIPE,
         text=True,
     )
     argv = json.loads(result.stdout)
-    require(isinstance(argv, list) and argv[0] == CONFIG, "print-args没有返回新配置实际参数")
+    require(isinstance(argv, list) and argv[0] == expected_config, "print-args没有返回指定配置实际参数")
     original = sys.argv
     try:
         sys.argv = ["train.py", *argv]
@@ -354,6 +359,229 @@ def checkpoint_counters(checkpoint: Path) -> dict:
         "parts_bytes": parts,
         "complete_checkpoint_bytes": directory_bytes(checkpoint),
     }
+
+
+def committed_checkpoint_files(checkpoint: Path, contract_path: Path) -> dict:
+    """只读提交元数据与文件目录；不导入Orbax或恢复任何训练态。"""
+    require(checkpoint.is_dir() and not checkpoint.is_symlink(), f"保存件目录不存在或为链接：{checkpoint}")
+    metadata = json.loads((checkpoint / "_CHECKPOINT_METADATA").read_text())
+    require(int(metadata.get("commit_timestamp_nsecs", 0)) > 0, "保存件尚未提交")
+    for name in ("params", "train_state"):
+        for filename in ("_METADATA", "manifest.ocdbt"):
+            path = checkpoint / name / filename
+            require(path.is_file() and path.stat().st_size > 0, f"保存件缺少非空文件：{path}")
+        for pattern in ("d/*", "ocdbt.process_*/d/*"):
+            require(
+                any(path.is_file() and path.stat().st_size > 0 for path in (checkpoint / name).glob(pattern)),
+                f"保存件缺少OCDBT数据文件：{name}/{pattern}",
+            )
+    norms = tuple((checkpoint / "assets").rglob("norm_stats.json"))
+    require(len(norms) == 1 and norms[0].stat().st_size > 0, "保存件动作归一化不完整")
+    saved_contract = checkpoint / "assets" / "training_contract.json"
+    require(sha256(saved_contract) == sha256(contract_path), "保存件合同与本次训练合同不同")
+    files = list(checkpoint.rglob("*"))
+    require(not any(path.is_symlink() for path in files), "保存件包含符号链接")
+    parts = {name: directory_bytes(checkpoint / name) for name in ("params", "train_state", "assets")}
+    require(all(size > 0 for size in parts.values()), "保存件params/train_state/assets为空")
+    return {
+        "step": int(checkpoint.name),
+        "verification": "committed_metadata_and_files_only",
+        "restore_test": "skipped_user_authorized",
+        "commit_timestamp_nsecs": int(metadata["commit_timestamp_nsecs"]),
+        "files": sum(path.is_file() for path in files),
+        "parts_bytes": parts,
+        "complete_checkpoint_bytes": directory_bytes(checkpoint),
+    }
+
+
+def verify_frozen_audit(path: Path, config_name: str, contract_sha256: str) -> dict:
+    """核对live训练态审计的实值证据，不从保存件加载模型。"""
+    audit = json.loads(path.read_text())
+    require(audit.get("schema_version") == 1 and audit.get("kind") == "ltmpi_frozen_siglip_audit", "冻结审计格式错误")
+    require(audit.get("status") == "PASS" and audit.get("config_name") == config_name, "冻结审计未通过或配置错误")
+    require(audit.get("contract_sha256") == contract_sha256, "冻结审计与本次训练合同不一致")
+    require(audit.get("expected_steps") == audit.get("metrics_count") == 20, "冻结审计未覆盖20次更新")
+    checks = (
+        "vision_unchanged",
+        "ema_vision_unchanged",
+        "vision_bfloat16",
+        "optimizer_vision_empty",
+        "nonvision_updated",
+        "optimizer_counts_match_step",
+        "completed_expected_steps",
+        "metrics_finite",
+    )
+    require(all(audit.get("checks", {}).get(key) is True for key in checks), "冻结审计缺少必要通过项")
+    initial, final = audit["initial"], audit["final"]
+    require(initial.get("step") == 0 and final.get("step") == 20, "冻结审计步数不是0→20")
+    for snapshot, step in ((initial, 0), (final, 20)):
+        require(snapshot.get("optimizer_vision_numeric_paths") == [], "视觉优化器仍有数值叶")
+        counts = snapshot.get("optimizer_counts", {})
+        require(bool(counts) and all(value == step for value in counts.values()), "live优化器计数不符")
+        for subtree in ("live_vision", "ema_vision"):
+            values = snapshot[subtree]
+            require(values.get("dtypes") == ["bfloat16"], "冻结视觉参数不是BF16")
+            require(bool(re.fullmatch(r"[0-9a-f]{64}", values.get("sha256", ""))), "视觉摘要不是SHA256")
+            require(values.get("leaf_count", 0) > 0 and values.get("parameter_count", 0) > 0, "视觉参数集合为空")
+    for subtree in ("live_vision", "ema_vision"):
+        require(initial[subtree] == final[subtree], f"冻结子树发生变化：{subtree}")
+    require(initial["live_vision"] == initial["ema_vision"], "视觉EMA初始化与固定参数不一致")
+    probes_before, probes_after = initial.get("nonvision_probes", {}), final.get("nonvision_probes", {})
+    require(bool(probes_before) and probes_before.keys() == probes_after.keys(), "非视觉审计集合不完整")
+    require(any(probes_before[key] != probes_after[key] for key in probes_before), "非视觉参数未更新")
+    return audit
+
+
+def existing_frozen_cache(env: dict[str, str]) -> dict:
+    """只读复用已有小库，核验已有清单及其绑定文件，禁止自动建库。"""
+    memory = Path(env["ROBOMME_MEMORY_CACHE"])
+    anchors = Path(env["ROBOMME_ANCHOR_CACHE"])
+    manifest = json.loads((memory / "manifest.json").read_text())
+    anchor_manifest = json.loads((anchors / "manifest.json").read_text())
+    require(manifest.get("status") == anchor_manifest.get("status") == "complete", "已有小库尚未完成")
+    require(
+        manifest.get("transition_frame_stride") == 4 and manifest.get("latent_dim") == 64, "已有小库不是stride4双视角"
+    )
+    require(manifest.get("cached_total_frames", 0) >= 128, "已有小库帧数不足")
+    pin = manifest.get("source_input_pin")
+    require(bool(pin) and anchor_manifest.get("source_input_pin") == pin, "小库与anchor输入身份不一致")
+    dataset = Path(env["ROBOMME_VIDEO_DATASET"]).resolve()
+    require(dataset.is_dir(), "已有smoke数据不存在")
+    for item in (manifest, anchor_manifest):
+        require(Path(item["dataset_root"]).resolve() == dataset, "小库清单与smoke数据根不一致")
+    hashes = {str(root / "manifest.json"): sha256(root / "manifest.json") for root in (memory, anchors)}
+    for root, item, pairs in (
+        (
+            memory,
+            manifest,
+            (("global_latents", "global_latents_sha256"), ("global_frame_index", "global_frame_index_sha256")),
+        ),
+        (
+            anchors,
+            anchor_manifest,
+            tuple(
+                (key, key.removesuffix("_file") + "_sha256")
+                for key in (
+                    "images_file",
+                    "execution_images_file",
+                    "episode_to_anchor_file",
+                    "exec_start_idx_file",
+                )
+            ),
+        ),
+    ):
+        for filename_key, hash_key in pairs:
+            path = root / item[filename_key]
+            digest = sha256(path)
+            require(digest == item[hash_key], f"已有缓存文件身份不符：{path}")
+            hashes[str(path)] = digest
+    return {
+        "status": "pass",
+        "mode": "reuse_read_only",
+        "dataset_frames": manifest["cached_total_frames"],
+        "source_input_pin": pin,
+        "files_sha256": hashes,
+    }
+
+
+def frozen_train_smoke(args, env, output, report, base_env, watch, checkpoint_root, initial_arrow_bytes) -> dict:
+    """冻结配置只跑一次20步训练，保存后仅核验文件，明确跳过恢复。"""
+    from openpi.shared.ltmpi_contract import FROZEN_S4_CONFIG_NAME
+
+    require(initial_arrow_bytes == 0, "冻结短测需要新的独立Arrow缓存目录")
+    require("smoke" in env["ROBOMME_EXP"].lower(), "冒烟run名必须含smoke")
+    require(not env.get("ROBOMME_UPLOAD_RECEIPTS_DIR"), "冒烟必须关闭上传回执")
+    require(not checkpoint_root.exists(), f"冒烟checkpoint目录已存在，不覆盖：{checkpoint_root}")
+    audit_path = output / "freeze-audit.json"
+    require(not audit_path.exists(), f"冻结审计报告已存在，不覆盖：{audit_path}")
+    cache = existing_frozen_cache(env)
+    common = {
+        "ROBOMME_CONFIG": FROZEN_S4_CONFIG_NAME,
+        "ROBOMME_NUM_TRAIN_STEPS": "20",
+        "ROBOMME_LR_DECAY_STEPS": "60000",
+        "ROBOMME_SAVE_STEPS": "20",
+        "ROBOMME_LOG_INTERVAL": "1",
+        "ROBOMME_RESUME": "0",
+        "ROBOMME_UPLOAD_RECEIPTS_DIR": "",
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "TRANSITION_FRAME_STRIDE": "4",
+        "HF_DATASETS_CACHE": base_env["HF_DATASETS_CACHE"],
+        "LTMPI_FROZEN_AUDIT_REPORT": str(audit_path),
+    }
+    smoke_env = overlay_env(args.env_file, output / "frozen-smoke20.env", common)
+    build_env = {**base_env, **common, "JAX_PLATFORMS": "cuda", "ROBOMME_ENV_FILE": str(smoke_env)}
+    original_environment = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update({**build_env, "JAX_PLATFORMS": "cpu", "CUDA_VISIBLE_DEVICES": ""})
+        config = effective_config(smoke_env, expected_config=FROZEN_S4_CONFIG_NAME, command_env=dict(os.environ))
+    finally:
+        os.environ.clear()
+        os.environ.update(original_environment)
+    require(config.num_train_steps == 20 and not config.resume, "冻结短测必须从0执行20步")
+    require(tuple(config.save_steps) == (20,) and config.log_interval == 1, "冻结短测必须每步记录并只保存20")
+    first = run_command(
+        ["bash", "bin/train.sh", "run"],
+        env=build_env,
+        log=output / "train20.log",
+        watch=watch,
+        timeout=args.timeout_hours * 3600,
+    )
+    metrics = verify_train_rows(first["rows"], 0, 20)
+    contract_path = Path(env["ROBOMME_TRAINING_CONTRACT"])
+    contract_digest = json.loads(contract_path.read_text())["contract_sha256"]
+    audit = verify_frozen_audit(audit_path, FROZEN_S4_CONFIG_NAME, contract_digest)
+    for name, digest in cache["files_sha256"].items():
+        require(sha256(Path(name)) == digest, f"短测修改了已有缓存：{name}")
+    checkpoint = committed_checkpoint_files(checkpoint_root / "20", contract_path)
+    complete, peak = checkpoint["complete_checkpoint_bytes"], first["peak_sampled_bytes"]["checkpoint"]
+    resources = {
+        "schema_version": 1,
+        "status": "pass",
+        "fork_commit": report["fork_commit"],
+        "config_name": FROZEN_S4_CONFIG_NAME,
+        "batch_size": 128,
+        "fsdp_devices": 8,
+        "num_train_steps": 20,
+        "completed_step": 20,
+        "lr_decay_steps": 60000,
+        "resume_test": "skipped_user_authorized",
+        "restore_test": "skipped_user_authorized",
+        "freeze_audit": audit,
+        "freeze_audit_path": str(audit_path),
+        "contract_sha256": contract_digest,
+        "contract_file_sha256": sha256(contract_path),
+        "complete_checkpoint_bytes": complete,
+        "checkpoint_parts_bytes": checkpoint["parts_bytes"],
+        "checkpoint_tree_peak_sampled_bytes": peak,
+        "checkpoint_extra_peak_sampled_bytes": max(0, peak - complete),
+        "arrow_cache_growth_bytes": max(0, first["peak_sampled_bytes"]["arrow_cache"] - initial_arrow_bytes),
+        "arrow_cache_path": base_env["HF_DATASETS_CACHE"],
+        "arrow_cache_baseline_bytes": initial_arrow_bytes,
+        "dataset_frames": cache["dataset_frames"],
+        "hf_cache_peak_sampled_bytes": first["peak_sampled_bytes"]["hf_cache"],
+        "independent_restore_copy_bytes": complete,
+        "independent_readback_copy_bytes": complete,
+        "independent_restore_copy_purpose": "remote_readback_budget_only",
+        "disk_safety_bytes": 10 * GIB,
+        "sampling_interval_seconds": 1.0,
+        "peak_is_lower_bound": True,
+        **metrics,
+    }
+    report["stages"].update(
+        cache=cache,
+        training={"status": "pass", "train20": metrics, "checkpoint20": checkpoint, "freeze_audit": audit},
+        resume="skipped_user_authorized",
+        restore="skipped_user_authorized",
+        online="skipped_user_authorized",
+    )
+    write_json(output / "resources.json", resources)
+    print(
+        "LTMPI_S4_FROZEN_TRAIN20=PASS updates=20 completed_step=20 resume_test=skipped_user_authorized "
+        "restore_test=skipped_user_authorized freeze_audit=PASS",
+        flush=True,
+    )
+    return resources
 
 
 class CapturePolicy:
@@ -645,9 +873,15 @@ def online_check(env_file: Path, checkpoint: Path, pair_batch_size: int) -> dict
 
 
 def main() -> int:
+    from openpi.shared.ltmpi_contract import FROZEN_S4_CONFIG_NAME
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env-file", type=Path, required=True)
-    parser.add_argument("--mode", choices=("smoke", "cache-smoke", "train-smoke", "online", "restore"), default="smoke")
+    parser.add_argument(
+        "--mode",
+        choices=("smoke", "cache-smoke", "train-smoke", "frozen-train-smoke", "online", "restore"),
+        default="smoke",
+    )
     parser.add_argument("--checkpoint", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--pair-batch-size", type=int, default=16)
@@ -656,6 +890,10 @@ def main() -> int:
     parser.add_argument("--result", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     env = read_env(args.env_file)
+    frozen = args.mode == "frozen-train-smoke"
+    if frozen or env.get("ROBOMME_CONFIG") == FROZEN_S4_CONFIG_NAME:
+        require(frozen and args.worker is None, "冻结配置只允许frozen-train-smoke，不执行恢复或在线worker")
+        require_clean_fork()
     if args.worker:
         # 环境文件可含8卡训练设置；worker的隔离设置由父进程确定，不允许被覆盖。
         isolation = {
@@ -678,7 +916,8 @@ def main() -> int:
             result = online_check(args.env_file, args.checkpoint, args.pair_batch_size)
         write_json(args.result, result)
         return 0
-    require(env.get("ROBOMME_CONFIG") == CONFIG, "只支持本任务新配置")
+    selected_config = FROZEN_S4_CONFIG_NAME if frozen else CONFIG
+    require(env.get("ROBOMME_CONFIG") == selected_config, "模式与任务配置不一致")
     require(args.pair_batch_size > 0 and args.timeout_hours > 0, "batch/timeout必须为正")
     output = (args.output_dir or Path(env["RUN_BASE_DIR"]) / env["ROBOMME_EXP"] / "runtime-verification").resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -691,11 +930,11 @@ def main() -> int:
     }
     report_path = output / (args.mode + "-result.json")
     python = env.get("PYTHON_BIN", sys.executable)
-    checkpoint_root = Path(env["CHECKPOINT_BASE_DIR"]) / CONFIG / env["ROBOMME_EXP"]
+    checkpoint_root = Path(env["CHECKPOINT_BASE_DIR"]) / selected_config / env["ROBOMME_EXP"]
     hf_cache = Path(env.get("HF_CACHE", "/scratch/hongze/.cache/huggingface"))
     arrow_cache = (
         output / f"arrow-cache-{args.mode}"
-        if args.mode in ("smoke", "cache-smoke", "train-smoke")
+        if args.mode in ("smoke", "cache-smoke", "train-smoke", "frozen-train-smoke")
         else Path(env.get("HF_DATASETS_CACHE", str(hf_cache / "datasets")))
     )
     watch = {"checkpoint": checkpoint_root, "hf_cache": hf_cache, "arrow_cache": arrow_cache}
@@ -746,7 +985,9 @@ def main() -> int:
         return json.loads(result_path.read_text())
 
     try:
-        if args.mode in ("smoke", "cache-smoke", "train-smoke"):
+        if frozen:
+            frozen_train_smoke(args, env, output, report, base_env, watch, checkpoint_root, initial_arrow_bytes)
+        elif args.mode in ("smoke", "cache-smoke", "train-smoke"):
             require(initial_arrow_bytes == 0, f"容量实测需要空的独立Arrow缓存，请使用新的--output-dir：{arrow_cache}")
             require(env.get("ROBOMME_UPLOAD_RECEIPTS_DIR", "") == "", "冒烟必须关闭上传回执")
             require("smoke" in env["ROBOMME_EXP"].lower(), "冒烟run名必须含smoke，避免误用正式目录")

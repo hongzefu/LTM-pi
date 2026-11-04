@@ -301,6 +301,25 @@ class Stride4ConfigurationTest(unittest.TestCase):
                 self.assertEqual(len(config_args), 1)
                 self.assertEqual(serve.STRIDE4_CONFIG in output, not extra)
 
+    def test_frozen_config_is_allowed_and_forwarded_by_shell(self):
+        self.assertIn(serve.FROZEN_STRIDE4_CONFIG, serve.SUPPORTED_CONFIGS)
+        self.assertIn(serve.STRIDE4_CONFIG, serve.SUPPORTED_CONFIGS)
+        self.assertIn(serve.DEFAULT_CONFIG, serve.SUPPORTED_CONFIGS)
+        with tempfile.TemporaryDirectory(dir="/scratch/hongze") as directory:
+            python = Path(directory) / "capture-python"
+            python.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
+            python.chmod(0o755)
+            env = {"PATH": os.environ["PATH"], "PYTHON_BIN": str(python), "ROBOMME_CONFIG": serve.FROZEN_STRIDE4_CONFIG}
+            script = Path(serve.__file__).resolve().parents[1] / "bin" / "serve.sh"
+            for extra in ([], ["--config", serve.DEFAULT_CONFIG], [f"--config={serve.DEFAULT_CONFIG}"]):
+                output = subprocess.check_output(
+                    ["bash", str(script), "--checkpoint", "fixture", *extra],
+                    env=env,
+                    text=True,
+                ).splitlines()
+                self.assertEqual(sum(arg == "--config" or arg.startswith("--config=") for arg in output), 1)
+                self.assertEqual(serve.FROZEN_STRIDE4_CONFIG in output, not extra)
+
 
 class ServerCheckpointContractTest(unittest.TestCase):
     def setUp(self):
