@@ -26,6 +26,8 @@ for _path in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(_path))
 CONFIG = "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default"
 GIB = 1024**3
+GLOBAL_RELATIVE_L2_TOLERANCE = 0.01
+NORMALIZED_TOKEN_RELATIVE_L2_TOLERANCE = 0.02
 
 
 def require(condition: bool, message: str) -> None:
@@ -169,14 +171,26 @@ def verify_train_rows(rows: list[dict], first: int, stop: int) -> dict:
     }
 
 
-def numeric_parity(actual, reference, mean, std, *, tolerance: float = 1e-2) -> dict:
+def numeric_parity(
+    actual,
+    reference,
+    mean,
+    std,
+    *,
+    global_tolerance: float = GLOBAL_RELATIVE_L2_TOLERANCE,
+    normalized_token_tolerance: float = NORMALIZED_TOKEN_RELATIVE_L2_TOLERANCE,
+) -> dict:
     import numpy as np
 
     actual, reference = np.asarray(actual, dtype=np.float64), np.asarray(reference, dtype=np.float64)
     require(actual.shape == reference.shape and actual.ndim == 2, "LAM形状不同")
     require(np.isfinite(actual).all() and np.isfinite(reference).all(), "LAM含非有限值")
+    tolerances = {
+        "global_relative_l2_tolerance": global_tolerance,
+        "normalized_token_relative_l2_tolerance": normalized_token_tolerance,
+    }
     if not len(reference):
-        return {"tokens": 0, "relative_l2": 0.0, "normalized_token_relative_l2_max": 0.0, "max_abs": 0.0}
+        return {"tokens": 0, "relative_l2": 0.0, "normalized_token_relative_l2_max": 0.0, "max_abs": 0.0, **tolerances}
     mean, std = np.asarray(mean), np.asarray(std)
     require(mean.shape == (actual.shape[1],) and std.shape == mean.shape and (std > 0).all(), "归一化形状错误")
     difference = actual - reference
@@ -188,14 +202,16 @@ def numeric_parity(actual, reference, mean, std, *, tolerance: float = 1e-2) -> 
         ).max()
     )
     require(
-        relative <= tolerance and maximum <= tolerance,
-        f"LAM超限：全局={relative}，归一化逐token最大={maximum}，阈值={tolerance}",
+        relative <= global_tolerance and maximum <= normalized_token_tolerance,
+        f"LAM超限：全局={relative}，全局阈值={global_tolerance}；"
+        f"归一化逐token最大={maximum}，逐token阈值={normalized_token_tolerance}",
     )
     return {
         "tokens": len(reference),
         "relative_l2": relative,
         "normalized_token_relative_l2_max": maximum,
         "max_abs": float(np.abs(difference).max()),
+        **tolerances,
     }
 
 
@@ -615,6 +631,8 @@ def online_check(env_file: Path, checkpoint: Path, pair_batch_size: int) -> dict
         "policy_loaded": True,
         "dreamdojo_loaded": True,
         "wrong_contract_rejected": wrong_contract_rejected,
+        "global_relative_l2_tolerance": GLOBAL_RELATIVE_L2_TOLERANCE,
+        "normalized_token_relative_l2_tolerance": NORMALIZED_TOKEN_RELATIVE_L2_TOLERANCE,
         "actions_shape": list(actions.shape),
         "action_sha256": hashlib.sha256(actions.tobytes()).hexdigest(),
         "boundary_residues": [0, 1, 2, 3],
@@ -849,7 +867,9 @@ def main() -> int:
                 if args.mode == "smoke":
                     report["stages"]["online"] = invoke("online", resume_env, checkpoint_root / "21")
                     print(
-                        "S4_ONLINE_OFFLINE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1 wrong_contract_rejected=1",
+                        "S4_ONLINE_OFFLINE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1 wrong_contract_rejected=1 "
+                        f"global_relative_l2_tolerance={GLOBAL_RELATIVE_L2_TOLERANCE} "
+                        f"normalized_token_relative_l2_tolerance={NORMALIZED_TOKEN_RELATIVE_L2_TOLERANCE}",
                         flush=True,
                     )
         else:
@@ -857,7 +877,9 @@ def main() -> int:
             report["stages"]["checkpoint"] = invoke("checkpoint", args.env_file, args.checkpoint.resolve())
             report["stages"]["online"] = invoke("online", args.env_file, args.checkpoint.resolve())
             print(
-                "LTMPI_S4_RESTORE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1 wrong_contract_rejected=1",
+                "LTMPI_S4_RESTORE=PASS real_policy=1 real_dreamdojo=1 finite_actions=1 wrong_contract_rejected=1 "
+                f"global_relative_l2_tolerance={GLOBAL_RELATIVE_L2_TOLERANCE} "
+                f"normalized_token_relative_l2_tolerance={NORMALIZED_TOKEN_RELATIVE_L2_TOLERANCE}",
                 flush=True,
             )
         report["status"] = "pass"

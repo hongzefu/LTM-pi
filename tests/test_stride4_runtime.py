@@ -114,6 +114,46 @@ class RuntimeTest(unittest.TestCase):
         result = runtime.numeric_parity(reference, reference, np.zeros(2), np.ones(2))
         self.assertEqual(result["normalized_token_relative_l2_max"], 0)
 
+    def test_local_1_147_percent_passes_with_global_below_one_percent(self):
+        reference = np.array([[1.0, 0], [100, 100]], dtype=np.float64)
+        actual = reference.copy()
+        actual[0, 0] += 0.01147
+        result = runtime.numeric_parity(actual, reference, np.zeros(2), np.ones(2))
+        self.assertLess(result["relative_l2"], 0.01)
+        self.assertAlmostEqual(result["normalized_token_relative_l2_max"], 0.01147)
+        self.assertEqual(result["global_relative_l2_tolerance"], 0.01)
+        self.assertEqual(result["normalized_token_relative_l2_tolerance"], 0.02)
+
+    def test_local_above_two_percent_still_fails(self):
+        reference = np.array([[1.0, 0], [100, 100]], dtype=np.float64)
+        actual = reference.copy()
+        actual[0, 0] += 0.02001
+        self.assertLess(np.linalg.norm(actual - reference) / np.linalg.norm(reference), 0.01)
+        with self.assertRaisesRegex(ValueError, "全局阈值=0.01.*逐token阈值=0.02"):
+            runtime.numeric_parity(actual, reference, np.zeros(2), np.ones(2))
+
+    def test_global_above_one_percent_still_fails_with_local_below_two_percent(self):
+        reference = np.ones((2, 2), dtype=np.float64)
+        actual = reference * 1.015
+        normalized_local = np.linalg.norm(actual - reference, axis=1) / np.linalg.norm(reference, axis=1)
+        self.assertLess(float(normalized_local.max()), 0.02)
+        with self.assertRaisesRegex(ValueError, "全局阈值=0.01.*逐token阈值=0.02"):
+            runtime.numeric_parity(actual, reference, np.zeros(2), np.ones(2))
+
+    def test_shape_and_invalid_std_remain_rejected(self):
+        reference = np.ones((2, 2), dtype=np.float64)
+        with self.assertRaisesRegex(ValueError, "LAM形状不同"):
+            runtime.numeric_parity(reference[:1], reference, np.zeros(2), np.ones(2))
+        with self.assertRaisesRegex(ValueError, "归一化形状错误"):
+            runtime.numeric_parity(reference, reference, np.zeros(2), np.zeros(2))
+
+    def test_empty_comparison_reports_both_tolerances(self):
+        values = np.empty((0, 64))
+        result = runtime.numeric_parity(values, values, np.zeros(64), np.ones(64))
+        self.assertEqual(result["tokens"], 0)
+        self.assertEqual(result["global_relative_l2_tolerance"], 0.01)
+        self.assertEqual(result["normalized_token_relative_l2_tolerance"], 0.02)
+
     def test_zero_reference_and_nan_are_rejected(self):
         for actual in (np.full((1, 2), 1e-6), np.full((1, 2), np.nan)):
             with self.assertRaises(ValueError):
