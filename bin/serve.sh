@@ -21,14 +21,19 @@ fi
 
 export PYTHONPATH="${BUNDLE_ROOT}/src:${BUNDLE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 args=("$@")
+has_config=false
 has_manifest=false
 has_dreamdojo_runtime=false
 has_dreamdojo_checkpoint=false
 for arg in "$@"; do
+  [[ ${arg} == --config || ${arg} == --config=* ]] && has_config=true
   [[ ${arg} == --memory-manifest ]] && has_manifest=true
   [[ ${arg} == --dreamdojo-runtime-root ]] && has_dreamdojo_runtime=true
   [[ ${arg} == --dreamdojo-checkpoint ]] && has_dreamdojo_checkpoint=true
 done
+if [[ ${has_config} == false && -n ${ROBOMME_CONFIG:-} ]]; then
+  args+=(--config "${ROBOMME_CONFIG}")
+fi
 if [[ ${has_manifest} == false && -n ${ROBOMME_MEMORY_CACHE:-} ]]; then
   args+=(--memory-manifest "${ROBOMME_MEMORY_CACHE}/manifest.json")
 fi
