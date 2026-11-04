@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +19,8 @@ from pathlib import Path
 from typing import Any
 
 S4_CONFIG_NAME = "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default"
+FROZEN_S4_CONFIG_NAME = "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_frozen_siglip_h50_default"
+S4_CONFIG_NAMES = (S4_CONFIG_NAME, FROZEN_S4_CONFIG_NAME)
 _OPERATIONAL_FIELDS = frozenset(
     {
         "num_train_steps",
@@ -49,6 +52,8 @@ def normalize(value: Any) -> Any:
         return normalize(value.value)
     if isinstance(value, os.PathLike):
         return str(value)
+    if isinstance(value, re.Pattern):
+        return {"pattern": value.pattern, "flags": value.flags}
     if dataclasses.is_dataclass(value):
         return {field.name: normalize(getattr(value, field.name)) for field in dataclasses.fields(value)}
     if isinstance(value, Mapping):
@@ -244,7 +249,7 @@ def prepare_training_contract(config: Any) -> dict | None:
     path = getattr(config, "training_contract_path", None)
     receipts = getattr(config, "checkpoint_upload_receipts_dir", None)
     if not path:
-        if config.name == S4_CONFIG_NAME or receipts:
+        if config.name in S4_CONFIG_NAMES or receipts:
             raise ValueError("新配置或上传等待必须设置 training_contract_path")
         return None
     if config.overwrite:
@@ -297,7 +302,7 @@ def validate_checkpoint_contract(checkpoint_dir: str | Path, config: Any, *, man
     checkpoint = Path(checkpoint_dir)
     path = checkpoint / "assets" / "training_contract.json"
     if not path.is_file():
-        if config.name == S4_CONFIG_NAME:
+        if config.name in S4_CONFIG_NAMES:
             raise ValueError("新配置的 checkpoint 缺少训练合同")
         return None
     if not checkpoint_is_committed(checkpoint):
