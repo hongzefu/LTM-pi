@@ -22,6 +22,11 @@ readonly ASSET_ID=${ROBOMME_ASSET_ID:-lerobot/robomme_16x1000}
 readonly HEAD_CACHE=${ROBOMME_HEAD_CACHE:-${ROBOMME_MEMORY_CACHE:-}.head32}
 readonly WRIST_CACHE=${ROBOMME_WRIST_CACHE:-${ROBOMME_MEMORY_CACHE:-}.wrist32}
 readonly CACHE_GPUS=${CACHE_GPUS:-}
+export PYTHONPATH="${BUNDLE_ROOT}/src:${BUNDLE_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+INPUT_ARGS=()
+if [[ -n ${ROBOMME_INPUT_MANIFEST:-} ]]; then
+  INPUT_ARGS=(--input-manifest "${ROBOMME_INPUT_MANIFEST}")
+fi
 
 die() { printf 'error: %s\n' "$*" >&2; exit 2; }
 required() { [[ -n ${2:-} ]] || die "missing $1; copy configs/paths.env.example to .env"; }
@@ -35,6 +40,18 @@ check_video_dataset() {
   required ROBOMME_VIDEO_DATASET "${ROBOMME_VIDEO_DATASET:-}"
   [[ -f ${ROBOMME_VIDEO_DATASET}/_READY ]] || die 'video dataset is not ready'
   [[ -f ${ROBOMME_VIDEO_DATASET}/meta/info.json ]] || die 'video dataset metadata is missing'
+  if [[ ${ROBOMME_CONFIG:-} == pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default ]]; then
+    required ROBOMME_INPUT_MANIFEST "${ROBOMME_INPUT_MANIFEST:-}"
+    [[ ${TRANSITION_FRAME_STRIDE:-1} == 4 ]] || die 'new stride4 configuration requires TRANSITION_FRAME_STRIDE=4'
+  fi
+  if [[ -n ${ROBOMME_INPUT_MANIFEST:-} ]]; then
+    "${PY}" - "${ROBOMME_VIDEO_DATASET}" "${ROBOMME_INPUT_MANIFEST}" <<'PY_VALIDATE'
+import sys
+from openpi.shared import ltmpi_contract
+root = ltmpi_contract.validate_dataset_root(sys.argv[1])
+ltmpi_contract.validate_source_input_manifest(sys.argv[2], dataset_root=root)
+PY_VALIDATE
+  fi
 }
 
 check_dreamdojo() {
@@ -50,7 +67,7 @@ build_anchors() {
   [[ ! -e ${ROBOMME_ANCHOR_CACHE} ]] || die "anchor output already exists: ${ROBOMME_ANCHOR_CACHE}"
   "${PY}" "${BUNDLE_ROOT}/scripts/build_anchor_cache.py" \
     --dataset-root "${ROBOMME_VIDEO_DATASET}" \
-    --output-dir "${ROBOMME_ANCHOR_CACHE}"
+    --output-dir "${ROBOMME_ANCHOR_CACHE}" "${INPUT_ARGS[@]}"
 }
 
 build_one_cache() {
@@ -64,13 +81,14 @@ build_one_cache() {
     --checkpoint-sha256 "${CHECKPOINT_SHA}"
     --image-key "${image_key}"
     --storage-dtype float32
-    --transition-frame-stride 1
+    --transition-frame-stride "${TRANSITION_FRAME_STRIDE:-1}"
     --pair-batch-size "${PAIR_BATCH_SIZE:-32}"
     --preprocess-chunk-size "${PREPROCESS_CHUNK_SIZE:-64}"
     --prefetch-episodes "${CACHE_PREFETCH_EPISODES:-0}"
     --sequence-window-crop-min-scale 1.0
     --sequence-window-crop-probability 0.0
     --repair
+    "${INPUT_ARGS[@]}"
   )
 
   if [[ -z ${CACHE_GPUS} ]]; then
@@ -107,13 +125,13 @@ build_one_cache() {
     --dataset-root "${ROBOMME_VIDEO_DATASET}" \
     --output-root "${output}" \
     --image-key "${image_key}" \
-    --checkpoint-sha256 "${CHECKPOINT_SHA}"
+    --checkpoint-sha256 "${CHECKPOINT_SHA}" "${INPUT_ARGS[@]}"
   "${PY}" "${BUNDLE_ROOT}/scripts/precompute_dreamdojo_memory.py" validate \
     --dataset-root "${ROBOMME_VIDEO_DATASET}" \
     --output-root "${output}" \
     --image-key "${image_key}" \
     --checkpoint-sha256 "${CHECKPOINT_SHA}" \
-    --verify-cache-hashes
+    --verify-cache-hashes "${INPUT_ARGS[@]}"
 }
 
 build_memory() {
@@ -141,23 +159,53 @@ build_memory() {
     build_one_cache image "${HEAD_CACHE}"
     build_one_cache wrist_image "${WRIST_CACHE}"
   fi
-  PYTHONPATH="${BUNDLE_ROOT}" "${PY}" "${BUNDLE_ROOT}/scripts/combine_dreamdojo_memory_caches.py" \
+  local -a combine_input_args=()
+  if [[ -n ${ROBOMME_INPUT_MANIFEST:-} ]]; then
+    combine_input_args=("${INPUT_ARGS[@]}" --dataset-root "${ROBOMME_VIDEO_DATASET}")
+  fi
+  "${PY}" "${BUNDLE_ROOT}/scripts/combine_dreamdojo_memory_caches.py" \
     --external-cache "${HEAD_CACHE}" \
     --wrist-cache "${WRIST_CACHE}" \
-    --output-root "${ROBOMME_MEMORY_CACHE}"
+    --output-root "${ROBOMME_MEMORY_CACHE}" "${combine_input_args[@]}"
 }
 
 compute_norm_stats() {
   check_video_dataset
   required ROBOMME_ASSETS_ROOT "${ROBOMME_ASSETS_ROOT:-}"
+  local source_input_pin=''
+  if [[ -n ${ROBOMME_INPUT_MANIFEST:-} ]]; then
+    source_input_pin=$("${PY}" - "${ROBOMME_INPUT_MANIFEST}" "${ROBOMME_VIDEO_DATASET}" <<'PY_PIN'
+import sys
+from openpi.shared import ltmpi_contract
+print(ltmpi_contract.validate_source_input_manifest(sys.argv[1], dataset_root=sys.argv[2])["source_input_pin"])
+PY_PIN
+    )
+  fi
   export ROBOMME_ASSET_ID=${ASSET_ID}
   export OPENPI_VIDEO_BACKEND=pyav
   export OPENPI_NORM_STATE_ACTION_ONLY=1
   export OPENPI_NORM_NUM_WORKERS=${OPENPI_NORM_NUM_WORKERS:-8}
   PYTHONPATH="${BUNDLE_ROOT}/src:${BUNDLE_ROOT}" JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= \
     "${PY}" "${BUNDLE_ROOT}/scripts/compute_norm_stats.py" \
-    --config-name pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default \
+    --config-name "${ROBOMME_CONFIG:-pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default}" \
     --output-dir "${ROBOMME_ASSETS_ROOT}/${ASSET_ID}"
+  check_video_dataset
+  if [[ -n ${ROBOMME_INPUT_MANIFEST:-} ]]; then
+    "${PY}" - "${ROBOMME_INPUT_MANIFEST}" "${ROBOMME_VIDEO_DATASET}" \
+      "${ROBOMME_ASSETS_ROOT}/${ASSET_ID}" "${source_input_pin}" <<'PY_NORM'
+import sys
+from pathlib import Path
+from openpi.shared import ltmpi_contract
+manifest = ltmpi_contract.validate_source_input_manifest(sys.argv[1], dataset_root=sys.argv[2])
+if manifest["source_input_pin"] != sys.argv[4]:
+    raise ValueError("source_input_pin changed during norm generation")
+output = Path(sys.argv[3])
+ltmpi_contract.write_json_atomic(output / "source_input_pin.json", {
+    "source_input_pin": manifest["source_input_pin"],
+    "norm_stats_sha256": ltmpi_contract.sha256_file(output / "norm_stats.json"),
+})
+PY_NORM
+  fi
 }
 
 check_python

@@ -44,6 +44,7 @@ def _validate_sources(left: dict, right: dict) -> None:
         "cache_schema_version",
         "dataset_root",
         "dataset_fingerprint",
+        "source_input_pin",
         "dataset_info_sha256",
         "dataset_episodes_sha256",
         "expected_episodes",
@@ -128,13 +129,31 @@ def _normalization(latents: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
-def combine(external_root: Path, wrist_root: Path, output_root: Path) -> None:
+def combine(
+    external_root: Path, wrist_root: Path, output_root: Path, *,
+    input_manifest: Path | None = None, dataset_root: Path | None = None,
+) -> None:
     external_root = external_root.expanduser().resolve()
     wrist_root = wrist_root.expanduser().resolve()
     output_root = output_root.expanduser().resolve()
     external_manifest = _load_manifest(external_root)
     wrist_manifest = _load_manifest(wrist_root)
     _validate_sources(external_manifest, wrist_manifest)
+    if (input_manifest is None) != (dataset_root is None):
+        raise ValueError("--input-manifest and --dataset-root must be supplied together")
+    source_input_pin = None
+    if input_manifest is not None:
+        source_input_pin = cache_lib.resolve_source_input_pin(dataset_root, input_manifest)
+        for manifest in (external_manifest, wrist_manifest):
+            if Path(manifest["dataset_root"]).resolve() != dataset_root.expanduser().resolve():
+                raise ValueError("source cache dataset_root does not match the actual input root")
+    if external_manifest.get("source_input_pin") != source_input_pin:
+        raise ValueError("source_input_pin mismatch; pinned caches require --input-manifest")
+    if source_input_pin is not None:
+        for root, manifest in ((external_root, external_manifest), (wrist_root, wrist_manifest)):
+            for key, default in (("global_frame_index", "frame_index.npz"), ("global_latents", "latents.npy")):
+                path = cache_lib.manifest_file(root, manifest, key, default)
+                cache_lib.validate_file_hash(manifest, key + "_sha256", path)
 
     external_index = _load_index(external_root, external_manifest)
     wrist_index = _load_index(wrist_root, wrist_manifest)
@@ -212,6 +231,10 @@ def combine(external_root: Path, wrist_root: Path, output_root: Path) -> None:
             ],
         }
     )
+    if source_input_pin is not None:
+        if cache_lib.resolve_source_input_pin(dataset_root, input_manifest) != source_input_pin:
+            raise ValueError("source_input_pin changed during cache combination")
+        manifest["source_input_pin"] = source_input_pin
     cache_lib.atomic_write_json(output_root / "manifest.json", manifest)
     print(
         f"combined rows={expected_rows} latent_dim={combined.shape[1]} valid={int(valid.sum())} "
@@ -225,8 +248,13 @@ def main() -> None:
     parser.add_argument("--external-cache", type=Path, required=True)
     parser.add_argument("--wrist-cache", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--input-manifest", type=Path, default=None)
+    parser.add_argument("--dataset-root", type=Path, default=None)
     args = parser.parse_args()
-    combine(args.external_cache, args.wrist_cache, args.output_root)
+    combine(
+        args.external_cache, args.wrist_cache, args.output_root,
+        input_manifest=args.input_manifest, dataset_root=args.dataset_root,
+    )
 
 
 if __name__ == "__main__":

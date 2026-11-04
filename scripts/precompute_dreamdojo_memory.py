@@ -88,6 +88,8 @@ class DatasetSpec:
     info_sha256: str
     episodes_sha256: str
     fingerprint: str
+    source_input_pin: str | None = None
+    input_manifest: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +111,7 @@ class CacheExpectation:
     preprocess_version: str = PREPROCESS_VERSION
     storage_dtype: str | None = None
     transition_frame_stride: int = 1
+    source_input_pin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -253,8 +256,28 @@ def load_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def discover_dataset(dataset_root: Path, *, require_all_parquets: bool = True) -> DatasetSpec:
+def resolve_source_input_pin(dataset_root: Path, input_manifest: Path | None) -> str | None:
+    """启用输入合同后，核对实际读取根与全部输入文件。"""
+    if input_manifest is None:
+        return None
+    from openpi.shared import ltmpi_contract
+
+    ltmpi_contract.validate_dataset_root(dataset_root)
+    manifest = ltmpi_contract.validate_source_input_manifest(input_manifest, dataset_root=dataset_root)
+    return str(manifest["source_input_pin"])
+
+
+def revalidate_source_input(dataset: DatasetSpec) -> None:
+    """完成写入前再次核对源文件，拒绝建库期间输入变化。"""
+    if resolve_source_input_pin(dataset.root, dataset.input_manifest) != dataset.source_input_pin:
+        raise ValueError("source_input_pin changed during cache generation")
+
+
+def discover_dataset(
+    dataset_root: Path, *, require_all_parquets: bool = True, input_manifest: Path | None = None
+) -> DatasetSpec:
     root = dataset_root.expanduser().resolve()
+    source_input_pin = resolve_source_input_pin(root, input_manifest)
     info_path = root / "meta" / "info.json"
     episodes_path = root / "meta" / "episodes.jsonl"
     if not info_path.is_file() or not episodes_path.is_file():
@@ -331,6 +354,8 @@ def discover_dataset(dataset_root: Path, *, require_all_parquets: bool = True) -
         info_sha256=info_sha256,
         episodes_sha256=episodes_sha256,
         fingerprint=fingerprint,
+        source_input_pin=source_input_pin,
+        input_manifest=input_manifest,
     )
 
 
@@ -822,7 +847,7 @@ def build_cache_arrays(
     latent_dtype = np.float16 if storage_dtype == "float16" else np.float32
     stored_latent = latent.astype(latent_dtype, copy=False)
     stored_latent[~valid] = 0
-    return {
+    arrays = {
         "schema_version": np.asarray(CACHE_SCHEMA_VERSION, dtype=np.int16),
         "latent": stored_latent,
         "valid": valid,
@@ -847,6 +872,10 @@ def build_cache_arrays(
         "dataset_episodes_sha256": scalar_string(dataset.episodes_sha256),
     }
 
+    if dataset.source_input_pin is not None:
+        arrays["source_input_pin"] = scalar_string(dataset.source_input_pin)
+    return arrays
+
 
 def _npz_scalar(data: Any, key: str) -> Any:
     value = data[key]
@@ -869,6 +898,7 @@ def read_cache_expectation(cache_path: Path) -> CacheExpectation:
             preprocess_version=str(_npz_scalar(data, "preprocess_version")),
             storage_dtype=str(data["latent"].dtype),
             transition_frame_stride=transition_frame_stride,
+            source_input_pin=(str(_npz_scalar(data, "source_input_pin")) if "source_input_pin" in data.files else None),
         )
 
 
@@ -914,6 +944,9 @@ def validate_cache(
             cache_stride = int(_npz_scalar(data, "transition_frame_stride")) if "transition_frame_stride" in data.files else 1
             if cache_stride <= 0:
                 raise ValueError(f"transition_frame_stride must be positive, got {cache_stride}")
+            actual_pin = str(_npz_scalar(data, "source_input_pin")) if "source_input_pin" in data.files else None
+            if actual_pin != expectation.source_input_pin:
+                raise ValueError("source_input_pin mismatch; pinned caches require --input-manifest")
             scalar_checks = {
                 "checkpoint_sha256": expectation.checkpoint_sha256,
                 "checkpoint_format": expectation.checkpoint_format,
@@ -1031,7 +1064,11 @@ def extract_command(args: argparse.Namespace) -> int:
         seed=args.sequence_augmentation_seed,
     )
     has_episode_filter = args.episode_start is not None or args.episode_stop is not None
-    dataset = discover_dataset(args.dataset_root, require_all_parquets=not has_episode_filter)
+    dataset = discover_dataset(
+        args.dataset_root,
+        require_all_parquets=not has_episode_filter or getattr(args, "input_manifest", None) is not None,
+        input_manifest=getattr(args, "input_manifest", None),
+    )
     checkpoint_path = args.checkpoint
     checkpoint = resolve_checkpoint_identity(
         checkpoint_path,
@@ -1055,6 +1092,7 @@ def extract_command(args: argparse.Namespace) -> int:
         checkpoint_format=checkpoint.format,
         checkpoint_step=checkpoint.step,
         dataset_fingerprint=dataset.fingerprint,
+        source_input_pin=dataset.source_input_pin,
         image_key=args.image_key,
         preprocess_version=preprocess_version,
         storage_dtype=args.storage_dtype,
@@ -1106,6 +1144,7 @@ def extract_command(args: argparse.Namespace) -> int:
             checkpoint_format=checkpoint.format,
             checkpoint_step=checkpoint.step,
             dataset_fingerprint=dataset.fingerprint,
+            source_input_pin=dataset.source_input_pin,
             image_key=args.image_key,
             preprocess_version=preprocess_version,
             storage_dtype=args.storage_dtype,
@@ -1198,6 +1237,9 @@ def extract_command(args: argparse.Namespace) -> int:
         "stage_seconds": stage_seconds if pending else {},
         "elapsed_seconds": time.time() - started,
     }
+    revalidate_source_input(dataset)
+    if dataset.source_input_pin is not None:
+        rank_summary["source_input_pin"] = dataset.source_input_pin
     atomic_write_json(output_root / "shards" / f"rank-{rank:05d}-of-{world_size:05d}.json", rank_summary)
     print(f"rank={rank} complete processed={processed} skipped={skipped} elapsed_seconds={time.time() - started:.1f}")
     return 0
@@ -1227,6 +1269,7 @@ def infer_expectation(
         checkpoint_format=inferred.checkpoint_format,
         checkpoint_step=inferred.checkpoint_step,
         dataset_fingerprint=dataset.fingerprint,
+        source_input_pin=dataset.source_input_pin,
         image_key=image_key or inferred.image_key,
         preprocess_version=inferred.preprocess_version,
         storage_dtype=inferred.storage_dtype,
@@ -1564,7 +1607,7 @@ def validate_file_hash(manifest: dict[str, Any], key: str, path: Path) -> None:
 
 
 def finalize_command(args: argparse.Namespace) -> int:
-    dataset = discover_dataset(args.dataset_root)
+    dataset = discover_dataset(args.dataset_root, input_manifest=getattr(args, "input_manifest", None))
     output_root = args.output_root.expanduser().resolve()
     check_extra_caches(dataset, output_root)
     expectation = infer_expectation(
@@ -1635,6 +1678,9 @@ def finalize_command(args: argparse.Namespace) -> int:
         "global_latents_sha256": sha256_file(output_root / "latents.npy"),
         "latent_normalization": latent_normalization,
     }
+    revalidate_source_input(dataset)
+    if dataset.source_input_pin is not None:
+        manifest["source_input_pin"] = dataset.source_input_pin
     atomic_write_json(output_root / "manifest.json", manifest)
     print(
         f"finalized status={manifest['status']} episodes={len(records)}/{len(dataset.episodes)} "
@@ -1711,9 +1757,11 @@ def validate_global_latents(
 
 
 def validate_command(args: argparse.Namespace) -> int:
-    dataset = discover_dataset(args.dataset_root)
+    dataset = discover_dataset(args.dataset_root, input_manifest=getattr(args, "input_manifest", None))
     output_root = args.output_root.expanduser().resolve()
     manifest = load_finalized_manifest(output_root)
+    if manifest.get("source_input_pin") != dataset.source_input_pin:
+        raise ValueError("source_input_pin mismatch; pinned caches require --input-manifest")
     validate_manifest_against_dataset(manifest, dataset, allow_incomplete=args.allow_incomplete)
     check_extra_caches(dataset, output_root)
     manifest_checkpoint_sha256 = _validate_sha256(str(manifest["checkpoint_sha256"]), "manifest checkpoint_sha256")
@@ -1731,6 +1779,7 @@ def validate_command(args: argparse.Namespace) -> int:
         checkpoint_format=str(manifest["checkpoint_format"]),
         checkpoint_step=manifest_int(manifest, "checkpoint_step"),
         dataset_fingerprint=dataset.fingerprint,
+        source_input_pin=dataset.source_input_pin,
         image_key=str(manifest["image_key"]),
         preprocess_version=str(manifest["preprocess_version"]),
         storage_dtype=str(manifest["latent_dtype"]),
@@ -1774,6 +1823,7 @@ def validate_command(args: argparse.Namespace) -> int:
         raise ValueError("manifest latent normalization mean does not match valid rows in global latents")
     if not np.allclose(stored_std, computed_std, rtol=1e-12, atol=1e-12):
         raise ValueError("manifest latent normalization std does not match valid rows in global latents")
+    revalidate_source_input(dataset)
     print(
         f"valid status={'partial' if missing else 'complete'} episodes={len(records)}/{len(dataset.episodes)} "
         f"frames={sum(record['num_frames'] for record in records)} checkpoint_sha256={expectation.checkpoint_sha256}"
@@ -1782,6 +1832,7 @@ def validate_command(args: argparse.Namespace) -> int:
 
 
 def add_dataset_output_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--input-manifest", type=Path, default=None, help="可选的完整源文件身份清单。")
     parser.add_argument("--dataset-root", type=Path, required=True, help="Local LeRobot v2 dataset root.")
     parser.add_argument("--output-root", type=Path, required=True, help="Directory containing per-episode caches.")
 
