@@ -115,6 +115,8 @@ class Pi0Config(_model.BaseModelConfig):
     # shared vision tower and the existing typed-memory embedding table, so it
     # introduces no new trainable parameters.
     memory_execution_anchor: bool = False
+    # 双视觉 anchor 的输出网格边长；0 保持原来的全部 patch token。
+    memory_anchor_pool_grid: int = 0
     # Reuse the action expert's Q/K/V/output attention projections for memory
     # tokens while retaining separate memory norms and FFN parameters.
     share_memory_attention: bool = False
@@ -604,6 +606,15 @@ class Pi0Config(_model.BaseModelConfig):
             raise ValueError("memory segment/anchor inputs require memory_horizon > 0")
         if self.memory_demo_anchor_feature_pool and not self.memory_demo_anchor:
             raise ValueError("memory_demo_anchor_feature_pool requires memory_demo_anchor")
+        if type(self.memory_anchor_pool_grid) is not int or self.memory_anchor_pool_grid < 0:
+            raise ValueError("memory_anchor_pool_grid 必须是非负整数")
+        if self.memory_anchor_pool_grid:
+            if 16 % self.memory_anchor_pool_grid:
+                raise ValueError("memory_anchor_pool_grid 必须整除 SigLIP 网格边长 16")
+            if not self.memory_demo_anchor or not self.memory_execution_anchor:
+                raise ValueError("anchor 池化要求同时启用 demo 和 execution anchor")
+            if self.memory_anchor_only or self.memory_episode_anchor or self.memory_demo_anchor_feature_pool:
+                raise ValueError("anchor 池化不支持 anchor_only、episode_anchor 或 demo_anchor_feature_pool")
         if self.memory_execution_anchor:
             if not self.memory_demo_anchor:
                 raise ValueError("memory_execution_anchor requires memory_demo_anchor")

@@ -697,6 +697,9 @@ class TrainConfig:
     # Optional exact completed-step checkpoints. When non-empty, these replace
     # save_interval and use update counts as directory names (no off-by-one).
     save_steps: tuple[int, ...] = ()
+    # 可选的训练身份合同及完整 checkpoint 上传回执；旧配置默认不启用。
+    training_contract_path: pathlib.Path | None = None
+    checkpoint_upload_receipts_dir: pathlib.Path | None = None
     # Optional resident fixed-pack validation. When configured, training uses
     # the live FSDP parameters at each interval to publish the next adaptive
     # replacement-sampling plan, without a separate policy process.
@@ -3515,6 +3518,48 @@ _CONFIGS = [
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
 ]
+
+# 从公开 fixedlag10 配置显式派生，保留未列出的全部模型与训练参数。
+_LTMPI_RELEASE_CONFIG = next(
+    config for config in _CONFIGS
+    if config.name == "pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _LTMPI_RELEASE_CONFIG,
+        name="pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default",
+        model=dataclasses.replace(_LTMPI_RELEASE_CONFIG.model, memory_stride=4, memory_anchor_pool_grid=4),
+        data=dataclasses.replace(
+            _LTMPI_RELEASE_CONFIG.data,
+            repo_id=os.environ.get("ROBOMME_VIDEO_DATASET", "external/robomme_16x100_lerobot_video_h264_v1"),
+            assets=AssetsConfig(
+                assets_dir=os.environ.get("ROBOMME_ASSETS_ROOT", "external/assets"),
+                asset_id=os.environ.get("ROBOMME_ASSET_ID", "lerobot/robomme_16x100"),
+            ),
+            base_config=dataclasses.replace(
+                _LTMPI_RELEASE_CONFIG.data.base_config,
+                memory_cache_dir=os.environ.get(
+                    "ROBOMME_MEMORY_CACHE", "external/robomme_16x100_dreamdojo_lam400k_head_wrist64_fp32_stride4_v1"
+                ),
+                demo_anchor_cache_dir=os.environ.get("ROBOMME_ANCHOR_CACHE", "external/robomme_16x100_dual_anchor_head_v1"),
+                memory_random_drop_execution_tail_min=3,
+                memory_random_drop_execution_tail_max=3,
+            ),
+        ),
+        num_train_steps=60_000,
+        save_steps=tuple(range(10_000, 60_001, 10_000)),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=2.5e-5, decay_steps=60_000, decay_lr=2.5e-6,
+        ),
+        policy_metadata={
+            **_LTMPI_RELEASE_CONFIG.policy_metadata,
+            "task": "RoboMME_official_16_tasks_x_100_episodes",
+            "memory_random_drop_execution_tail": "fixed_integer_3_per_sample",
+            "memory_stride": 4,
+            "memory_anchor_pool_grid": 4,
+        },
+    )
+)
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")

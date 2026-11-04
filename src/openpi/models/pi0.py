@@ -1,4 +1,5 @@
 import logging
+import math
 
 import einops
 import flax.nnx as nnx
@@ -14,6 +15,28 @@ import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 logger = logging.getLogger("openpi")
+
+
+def pool_anchor_tokens(tokens, grid: int):
+    """把方形视觉网格均值池化到指定边长；零表示保持原输入。"""
+    if type(grid) is not int or grid < 0:
+        raise ValueError("memory_anchor_pool_grid 必须是非负整数")
+    if grid == 0:
+        return tokens
+    if tokens.ndim != 3:
+        raise ValueError("anchor token 必须具有 [batch, patches, width] 形状")
+    batch, count, width = tokens.shape
+    side = math.isqrt(count)
+    if side * side != count or side == 0 or side % grid:
+        raise ValueError("anchor patch 数必须是正平方数，且网格边长必须整除其边长")
+    window = side // grid
+    pooled = nnx.avg_pool(
+        tokens.reshape(batch, side, side, width),
+        window_shape=(window, window),
+        strides=(window, window),
+        padding="VALID",
+    )
+    return pooled.reshape(batch, grid * grid, width)
 
 
 def replace_valid_memory_with_fixed_random_latent(latents, mask, seed: int):
@@ -883,6 +906,7 @@ class Pi0(_model.BaseModel):
                 if obs.memory_demo_start_image is None:
                     raise ValueError("image demo anchor requires memory_demo_start_image")
                 anchor_tokens, _ = self.PaliGemma.img(obs.memory_demo_start_image, train=False)
+                anchor_tokens = pool_anchor_tokens(anchor_tokens, self.config.memory_anchor_pool_grid)
             if self.config.memory_execution_anchor:
                 demo_type_ids = jnp.full(
                     anchor_tokens.shape[:2], self.config.memory_demo_anchor_type_id, dtype=jnp.int32
@@ -1131,6 +1155,7 @@ class Pi0(_model.BaseModel):
                     "memory_execution_anchor requires memory_execution_start_image and memory_execution_start_mask"
                 )
             execution_anchor_tokens, _ = self.PaliGemma.img(obs.memory_execution_start_image, train=False)
+            execution_anchor_tokens = pool_anchor_tokens(execution_anchor_tokens, self.config.memory_anchor_pool_grid)
             execution_anchor_tokens = jnp.asarray(execution_anchor_tokens, dtype=tokens.dtype)
             execution_type_ids = jnp.full(
                 execution_anchor_tokens.shape[:2], self.config.memory_execution_anchor_type_id, dtype=jnp.int32
