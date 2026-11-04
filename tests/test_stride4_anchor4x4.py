@@ -88,6 +88,28 @@ class PoolTest(unittest.TestCase):
 
 
 class ConfigTest(unittest.TestCase):
+    def test_frozen_config_only_changes_vision_training_semantics(self):
+        base = config_lib.get_config(NEW_NAME)
+        frozen = config_lib.get_config(
+            "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_frozen_siglip_h50_default"
+        )
+        self.assertEqual(
+            _changed_paths(base, frozen),
+            {
+                "name", "freeze_filter", "policy_metadata.frozen_siglip",
+                "policy_metadata.frozen_siglip_parameter_dtype", "policy_metadata.frozen_siglip_ema_policy",
+            },
+        )
+        parameter = nnx.Param(jnp.zeros((2,)))
+        self.assertTrue(frozen.freeze_filter(("PaliGemma", "img", "embedding", "kernel"), parameter))
+        for path in (
+            ("PaliGemma", "llm", "kernel"), ("memory_projector", "kernel"),
+            ("memory_segment_embed", "embedding"), ("action_out_proj", "kernel"),
+            ("other", "PaliGemma", "img", "kernel"), ("PaliGemma", "img_adapter", "kernel"),
+        ):
+            self.assertFalse(frozen.freeze_filter(path, parameter), path)
+            self.assertTrue(frozen.trainable_filter(path, parameter), path)
+
     def test_complete_config_difference_whitelist_and_defaults(self):
         with mock.patch.dict(
             os.environ, {key: value for key, value in os.environ.items() if key not in ENV_KEYS}, clear=True
