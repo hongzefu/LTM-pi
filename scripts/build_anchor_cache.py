@@ -82,9 +82,18 @@ def _decode_video_anchors(path: Path, execution_index: int) -> tuple[np.ndarray,
 def main(
     dataset_root: Path,
     output_dir: Path,
+    input_manifest: Path | None = None,
 ) -> None:
     dataset_root = dataset_root.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
+    source_input_pin = None
+    if input_manifest is not None:
+        from openpi.shared import ltmpi_contract
+
+        ltmpi_contract.validate_dataset_root(dataset_root)
+        source_input_pin = ltmpi_contract.validate_source_input_manifest(
+            input_manifest, dataset_root=dataset_root
+        )["source_input_pin"]
     info_path = dataset_root / "meta" / "info.json"
     episodes_path = dataset_root / "meta" / "episodes.jsonl"
     info = json.loads(info_path.read_text())
@@ -199,6 +208,11 @@ def main(
             "exec_start_idx_file": "exec_start_idx.npy",
             "exec_start_idx_sha256": _sha256(exec_path),
         }
+        if input_manifest is not None:
+            verified = ltmpi_contract.validate_source_input_manifest(input_manifest, dataset_root=dataset_root)
+            if verified["source_input_pin"] != source_input_pin:
+                raise ValueError("source_input_pin changed during anchor generation")
+            manifest["source_input_pin"] = source_input_pin
         (temporary_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         for path in temporary_dir.iterdir():
             os.replace(path, output_dir / path.name)
