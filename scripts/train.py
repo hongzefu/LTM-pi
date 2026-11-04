@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import json
 import logging
 import os
 import platform
@@ -19,6 +20,7 @@ from flax.training import common_utils
 
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
+import openpi.shared.ltmpi_contract as _ltmpi_contract
 import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
@@ -515,10 +517,24 @@ def microbatch_gradient_step(
     return _scale_gradients(grads, config.gradient_accumulation_steps), info
 
 
+def _close_training_loader(data_iter, data_loader):
+    # 先结束生成器，再回收常驻 worker，保持正常退出的既有顺序。
+    close_iter = getattr(data_iter, "close", None)
+    if callable(close_iter):
+        close_iter()
+    close_loader = getattr(data_loader, "close", None)
+    if callable(close_loader):
+        close_loader()
+
+
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
     validate_memory_normalization_requirement(config)
+    training_contract = _ltmpi_contract.prepare_training_contract(config)
+    receipts_dir = getattr(config, "checkpoint_upload_receipts_dir", None) or None
+    if receipts_dir and not os.environ.get("LTMPI_CHECKPOINT_REQUIRED_BYTES", ""):
+        raise ValueError("启用上传等待必须设置实测 LTMPI_CHECKPOINT_REQUIRED_BYTES")
 
     physical_batch_size = _physical_batch_size(
         config.batch_size,
@@ -526,7 +542,10 @@ def main(config: _config.TrainConfig):
         config.gradient_accumulation_steps,
     )
 
-    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
+    jax.config.update(
+        "jax_compilation_cache_dir",
+        str(epath.Path(os.environ.get("JAX_COMPILATION_CACHE_DIR", "~/.cache/jax")).expanduser()),
+    )
 
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
@@ -540,6 +559,7 @@ def main(config: _config.TrainConfig):
         keep_period=config.keep_period,
         overwrite=config.overwrite,
         resume=config.resume,
+        preserve_checkpoints=bool(receipts_dir),
     )
     source_checkpoint_manager = None
     if config.restore_checkpoint_dir is not None:
@@ -568,6 +588,19 @@ def main(config: _config.TrainConfig):
             config.restore_checkpoint_step,
         )
     resuming = output_resuming or source_checkpoint_manager is not None
+    if resuming:
+        restore_root = epath.Path(config.restore_checkpoint_dir or config.checkpoint_dir)
+        restore_manager = source_checkpoint_manager or checkpoint_manager
+        restore_step = (
+            config.restore_checkpoint_step if source_checkpoint_manager is not None else restore_manager.latest_step()
+        )
+        checkpoint_contract_path = restore_root / str(restore_step) / "assets" / "training_contract.json"
+        if checkpoint_contract_path.exists():
+            restored_contract = _ltmpi_contract.validate_training_contract(checkpoint_contract_path)
+            if training_contract is None or restored_contract["semantic_sha256"] != training_contract["semantic_sha256"]:
+                raise ValueError("恢复 checkpoint 的训练语义与实际配置不符")
+        elif training_contract is not None:
+            raise ValueError("启用合同后不能恢复缺少合同的 checkpoint")
     # An external restore begins a distinct output experiment, so it must
     # create its own W&B run instead of trying to reuse the source run ID.
     init_wandb(config, resuming=output_resuming, enabled=config.wandb_enabled)
@@ -693,6 +726,22 @@ def main(config: _config.TrainConfig):
             )
 
     start_step = int(train_state.step)
+    if training_contract is not None:
+        optimizer_counts = {}
+        for path, leaf in jax.tree_util.tree_flatten_with_path(train_state.opt_state)[0]:
+            if any(getattr(key, "name", getattr(key, "key", None)) == "count" for key in path):
+                value = np.asarray(jax.device_get(leaf))
+                if value.shape == ():
+                    optimizer_counts[jax.tree_util.keystr(path)] = int(value)
+        logging.info(
+            "LTMPI_TRAIN_STATE=%s",
+            json.dumps({
+                "start_step": start_step,
+                "learning_rate": float(config.lr_schedule.create()(start_step)),
+                "optimizer_counts": optimizer_counts,
+            }, sort_keys=True),
+        )
+        # 普通 Python 采样器仍按原路径重新迭代；合同不声称逐样本恢复。
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -742,6 +791,11 @@ def main(config: _config.TrainConfig):
             # Keep the round-trip representation of each scalar.  The text
             # log is also consumed by the live W&B sidecar, so formatting
             # with ``.4f`` would irreversibly quantize metrics before upload.
+            if training_contract is not None:
+                if not all(np.isfinite(value).all() for value in reduced_info.values()):
+                    raise RuntimeError(f"训练指标非有限：step={step}")
+                reduced_info["completed_step"] = np.asarray(step + 1)
+                reduced_info["learning_rate"] = np.asarray(config.lr_schedule.create()(step))
             info_str = ", ".join(f"{k}={np.asarray(v).item()!r}" for k, v in reduced_info.items())
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
@@ -759,7 +813,31 @@ def main(config: _config.TrainConfig):
             and completed_step % config.adaptive_mse_eval_interval_steps == 0
         )
         if should_save:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, checkpoint_step)
+            if training_contract is not None:
+                checkpoint_manager.wait_until_finished()
+                try:
+                    # 冒烟尚无落盘实测时，以完整状态原始数组字节量作保守预算。
+                    raw_state_bytes = sum(getattr(leaf, "nbytes", 0) for leaf in jax.tree.leaves(train_state))
+                    required_bytes = int(os.environ.get("LTMPI_CHECKPOINT_REQUIRED_BYTES", raw_state_bytes))
+                    reserve_bytes = int(os.environ.get("LTMPI_CHECKPOINT_MIN_FREE_BYTES", 10 * 1024**3))
+                    if receipts_dir:
+                        _ltmpi_contract.before_checkpoint_save(
+                            config.checkpoint_dir, receipts_dir, required_bytes=required_bytes,
+                            reserve_bytes=reserve_bytes,
+                            timeout_seconds=float(os.environ.get("LTMPI_UPLOAD_TIMEOUT_SECONDS", 7200)),
+                        )
+                    else:
+                        _ltmpi_contract.check_checkpoint_capacity(
+                            config.checkpoint_dir, required_bytes=required_bytes, reserve_bytes=reserve_bytes
+                        )
+                except Exception:
+                    # 等待期间没有在写 checkpoint，保留最新完整件并正常收拢资源。
+                    checkpoint_manager.close()
+                    _close_training_loader(data_iter, data_loader)
+                    raise
+            _checkpoints.save_state(
+                checkpoint_manager, train_state, data_loader, checkpoint_step, training_contract=training_contract
+            )
         if should_evaluate_adaptive_mse:
             if should_save:
                 # At a save/eval coincidence, evaluate the fully committed
@@ -781,16 +859,20 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if receipts_dir and checkpoint_manager.latest_step() is not None:
+        try:
+            _ltmpi_contract.wait_for_checkpoint_upload(
+                config.checkpoint_dir / str(checkpoint_manager.latest_step()), receipts_dir,
+                timeout_seconds=float(os.environ.get("LTMPI_UPLOAD_TIMEOUT_SECONDS", 7200)),
+            )
+        finally:
+            checkpoint_manager.close()
+            _close_training_loader(data_iter, data_loader)
 
     # End the public generator before explicitly reaping persistent Torch
     # workers. Otherwise their destruction may race interpreter/JAX teardown
     # and turn a completed run into a late C++ abort.
-    close_data_iter = getattr(data_iter, "close", None)
-    if callable(close_data_iter):
-        close_data_iter()
-    close_data_loader = getattr(data_loader, "close", None)
-    if callable(close_data_loader):
-        close_data_loader()
+    _close_training_loader(data_iter, data_loader)
 
 if __name__ == "__main__":
     main(_config.cli())

@@ -6,15 +6,16 @@ import dataclasses
 import logging
 from typing import Protocol
 
-from etils import epath
 import jax
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
+from etils import epath
 
-from openpi.shared import array_typing as at
+import openpi.shared.ltmpi_contract as _ltmpi_contract
 import openpi.shared.normalize as _normalize
 import openpi.training.data_loader as _data_loader
 import openpi.training.utils as training_utils
+from openpi.shared import array_typing as at
 
 
 def initialize_checkpoint_dir(
@@ -24,6 +25,7 @@ def initialize_checkpoint_dir(
     overwrite: bool,
     resume: bool,
     read_only: bool = False,
+    preserve_checkpoints: bool = False,
 ) -> tuple[ocp.CheckpointManager, bool]:
     checkpoint_dir = epath.Path(checkpoint_dir).resolve()
     if read_only and overwrite:
@@ -52,7 +54,8 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=1,
+            # 上传器在逐文件读回后负责清理，避免 Orbax 提前删除唯一恢复点。
+            max_to_keep=None if preserve_checkpoints else 1,
             keep_period=keep_period,
             create=False,
             # A restore-only source manager must not retain an asynchronous
@@ -79,6 +82,8 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    training_contract: dict | None = None,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -86,6 +91,9 @@ def save_state(
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             _normalize.save(directory / data_config.asset_id, norm_stats)
+        if training_contract is not None:
+            # 与 train_state、params 同属一次 Orbax 原子提交。
+            _ltmpi_contract.write_json_atomic(directory / "training_contract.json", training_contract)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
