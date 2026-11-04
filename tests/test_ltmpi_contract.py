@@ -322,6 +322,19 @@ class ContractTest(unittest.TestCase):
 
 
 class TrainLauncherTest(unittest.TestCase):
+    @mock.patch.dict(
+        os.environ,
+        {
+            "ROBOMME_CONFIG": "inherited-config",
+            "ROBOMME_NUM_TRAIN_STEPS": "20",
+            "ROBOMME_LR_DECAY_STEPS": "60000",
+            "ROBOMME_SAVE_STEPS": "20",
+            "ROBOMME_LOG_INTERVAL": "1",
+            "ROBOMME_RESUME": "1",
+            "ROBOMME_TRAINING_CONTRACT": "/inherited/contract.json",
+            "ROBOMME_UPLOAD_RECEIPTS_DIR": "/inherited/receipts",
+        },
+    )
     def test_default_and_smoke_args_preserve_independent_decay_and_empty_receipts(self):
         with tempfile.TemporaryDirectory(prefix="ltmpi-launch-", dir="/scratch/hongze") as temporary:
             root = Path(temporary)
@@ -332,8 +345,12 @@ class TrainLauncherTest(unittest.TestCase):
             (root / "assets/id/norm_stats.json").write_text("{}")
             env_file = root / ".env"
             env_file.write_text("ROBOMME_UPLOAD_RECEIPTS_DIR=/formal/receipts\nROBOMME_RESUME=0\n")
+            # 验收入口会导出真实 run 的 .env；夹具只继承系统环境，训练值由本例显式声明。
+            inherited_env = {
+                key: value for key, value in os.environ.items() if not key.startswith(("ROBOMME_", "LTMPI_"))
+            }
             env = {
-                **os.environ,
+                **inherited_env,
                 "PYTHON_BIN": sys.executable,
                 "ROBOMME_ENV_FILE": str(env_file),
                 "ROBOMME_VIDEO_DATASET": str(root / "dataset"),
@@ -347,6 +364,11 @@ class TrainLauncherTest(unittest.TestCase):
             }
             script = Path(__file__).resolve().parents[1] / "bin/train.sh"
             args = json.loads(subprocess.check_output(["bash", str(script), "print-args"], env=env, text=True))
+            self.assertEqual(args[0], "pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default")
+            self.assertEqual(args[args.index("--log-interval") + 1], "20")
+            self.assertNotIn("--resume", args)
+            self.assertNotIn("--training-contract-path", args)
+            self.assertNotIn("--checkpoint-upload-receipts-dir", args)
             self.assertEqual(args[args.index("--num-train-steps") + 1], "120000")
             self.assertEqual(args[args.index("--lr-schedule.decay-steps") + 1], "120000")
             self.assertEqual(
