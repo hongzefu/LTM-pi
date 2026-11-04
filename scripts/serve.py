@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""Serve the fixed-lag-10 RoboMME policy and its DreamDojo visual encoder.
+"""提供固定尾部延迟的 RoboMME 策略及 DreamDojo 视觉编码服务。
 
-Each websocket connection owns an independent causal memory history.  The
-shared JAX policy and DreamDojo encoder are serialized on one GPU so several
-simulator workers can overlap environment stepping without duplicating model
-weights.
+每个连接拥有独立的因果记忆；共享策略和编码器串行执行，允许环境并行推进。
 """
 
 from __future__ import annotations
@@ -33,6 +30,8 @@ for _path in (str(_RUNTIME_ROOT), str(_RUNTIME_ROOT / "src")):
 
 
 DEFAULT_CONFIG = "pi05_robomme_16x1000_dreamdojo_lmv_causal_fixedlag10_h50_default"
+STRIDE4_CONFIG = "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default"
+SUPPORTED_CONFIGS = frozenset((DEFAULT_CONFIG, STRIDE4_CONFIG))
 DEFAULT_DREAMDOJO_RUNTIME_ROOT = _RUNTIME_ROOT / "third_party" / "dreamdojo" / "runtime"
 EXPECTED_ENCODER_SHA256 = "d77bf1b307b6e6d0a2800a2636afee8223a7bf19f15a8583eebd3f8979f1c44f"
 EXPECTED_CHECKPOINT_FORMAT = "dreamdojo.lightning"
@@ -81,15 +80,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--memory-lag",
         type=int,
-        default=10,
-        help="Hide this many newest execution LAM tokens at inference; must match fixed-lag training.",
+        default=None,
+        help="隐藏最新的执行 LAM token 数；默认读取所选训练配置，显式值必须与训练一致。",
     )
     parser.add_argument("--pair-batch-size", type=int, default=16)
     parser.add_argument(
         "--transition-frame-stride",
         type=int,
         default=None,
-        help="Expected causal DreamDojo endpoint stride; defaults to the cache manifest value.",
+        help="因果 DreamDojo 端点步长；默认读取所选训练配置，必须与缓存清单一致。",
     )
     parser.add_argument(
         "--verify-dreamdojo-sha256",
@@ -105,7 +104,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _load_manifest(path: Path, latent_dim: int) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
+def _load_manifest(
+    path: Path, latent_dim: int, *, transition_frame_stride: int = 1
+) -> tuple[dict[str, Any], np.ndarray, np.ndarray]:
+    from scripts.precompute_dreamdojo_memory import (
+        alignment_for_transition_frame_stride,
+        manifest_transition_frame_stride,
+    )
+
     path = path.expanduser().resolve()
     manifest = json.loads(path.read_text())
     normalization = manifest.get("latent_normalization")
@@ -122,16 +128,17 @@ def _load_manifest(path: Path, latent_dim: int) -> tuple[dict[str, Any], np.ndar
     if int(manifest.get("latent_dim", -1)) != latent_dim:
         raise ValueError(f"LAM manifest latent_dim={manifest.get('latent_dim')} does not match model {latent_dim}")
     expected = {
-        "alignment": EXPECTED_ALIGNMENT,
+        "alignment": alignment_for_transition_frame_stride(transition_frame_stride),
         "image_keys": ["image", "wrist_image"],
         "latent_layout": "concat(image_z_mu[32],wrist_image_z_mu[32])",
         "latent_dtype": "float32",
         "preprocess_version": "dreamdojo.lam400k.rgb_uint8.crop_4x3.resize_480x640.resize_240x320.v1",
-        "transition_frame_stride": 1,
+        "transition_frame_stride": transition_frame_stride,
     }
+    manifest_transition_frame_stride(manifest)
     mismatches = {key: (manifest.get(key), value) for key, value in expected.items() if manifest.get(key) != value}
     if mismatches:
-        raise ValueError(f"Memory manifest is not the fixed-lag-10 training manifest: {mismatches}")
+        raise ValueError(f"记忆清单与所选训练配置不一致: {mismatches}")
     manifest_encoder = (
         str(manifest.get("checkpoint_format", "")),
         str(manifest.get("checkpoint_sha256", "")),
@@ -139,6 +146,25 @@ def _load_manifest(path: Path, latent_dim: int) -> tuple[dict[str, Any], np.ndar
     if manifest_encoder not in COMPATIBLE_ENCODER_IDENTITIES:
         raise ValueError(f"Memory manifest has an unsupported DreamDojo encoder identity: {manifest_encoder}")
     return manifest, mean, std
+
+
+def _configured_memory_settings(config: Any, args: argparse.Namespace) -> tuple[int, int]:
+    """从训练配置取固定延迟和端点步长，拒绝命令行改变训练语义。"""
+    data = config.data.base_config
+    lag = data.memory_random_drop_execution_tail_min
+    maximum = data.memory_random_drop_execution_tail_max
+    if type(lag) is not int or lag < 0 or type(maximum) is not int or maximum != lag:
+        raise ValueError(f"在线服务要求固定的非负执行尾部延迟，得到 min={lag}, max={maximum}")
+    if config.policy_metadata.get("memory_random_drop_execution_tail") != f"fixed_integer_{lag}_per_sample":
+        raise ValueError(f"配置元数据没有声明固定执行尾部延迟 {lag}")
+    if args.memory_lag is not None and args.memory_lag != lag:
+        raise ValueError(f"memory-lag 必须与训练值 {lag} 一致，得到 {args.memory_lag}")
+    stride = config.model.memory_stride
+    if type(stride) is not int or stride <= 0:
+        raise ValueError(f"训练配置 memory_stride 必须为正整数，得到 {stride}")
+    if args.transition_frame_stride is not None and args.transition_frame_stride != stride:
+        raise ValueError(f"transition-frame-stride 必须与训练值 {stride} 一致，得到 {args.transition_frame_stride}")
+    return lag, stride
 
 
 def _checkpoint_is_committed(path: Path) -> None:
@@ -514,16 +540,15 @@ def main() -> None:
     args = parse_args()
     if args.num_inference_steps <= 0 or args.pair_batch_size <= 0:
         raise ValueError("num-inference-steps and pair-batch-size must be positive")
-    if args.memory_lag != 10:
-        raise ValueError(f"This checkpoint family was trained with fixed memory lag 10, got {args.memory_lag}")
-    if args.config != DEFAULT_CONFIG:
-        raise ValueError(f"This release only supports config {DEFAULT_CONFIG!r}, got {args.config!r}")
+    if args.config not in SUPPORTED_CONFIGS:
+        raise ValueError(f"服务不支持配置 {args.config!r}；允许值为 {sorted(SUPPORTED_CONFIGS)}")
     checkpoint = args.checkpoint.expanduser().resolve()
     _checkpoint_is_committed(checkpoint)
 
     from openpi.training import config as training_config
 
     config = training_config.get_config(args.config)
+    memory_lag, transition_frame_stride = _configured_memory_settings(config, args)
     if not config.model.use_memory:
         raise ValueError(f"Config {args.config} is not memory-enabled")
     expected_model_values = {
@@ -541,8 +566,6 @@ def main() -> None:
     }
     if model_mismatches:
         raise ValueError(f"Config is not compatible with this standalone runtime: {model_mismatches}")
-    if config.policy_metadata.get("memory_random_drop_execution_tail") != "fixed_integer_10_per_sample":
-        raise ValueError("Config metadata does not declare fixed execution-tail lag 10")
     if config.policy_metadata.get("memory_encoder_checkpoint_sha256") not in {
         identity[1] for identity in COMPATIBLE_ENCODER_IDENTITIES
     }:
@@ -552,13 +575,9 @@ def main() -> None:
         raise ValueError(
             f"max-token-len must match the training value {training_max_token_len}, got {args.max_token_len}"
         )
-    manifest, mean, std = _load_manifest(args.memory_manifest, config.model.memory_latent_dim)
-    manifest_stride = int(manifest.get("transition_frame_stride", 1))
-    transition_frame_stride = args.transition_frame_stride or manifest_stride
-    if transition_frame_stride != manifest_stride or transition_frame_stride <= 0:
-        raise ValueError(
-            f"transition_frame_stride={transition_frame_stride} does not match manifest stride={manifest_stride}"
-        )
+    manifest, mean, std = _load_manifest(
+        args.memory_manifest, config.model.memory_latent_dim, transition_frame_stride=transition_frame_stride
+    )
     two_view_memory = manifest.get("image_keys") == ["image", "wrist_image"]
     if two_view_memory != (config.model.memory_latent_dim == 64):
         raise ValueError(
@@ -578,6 +597,10 @@ def main() -> None:
             memory_latent_std=tuple(float(value) for value in std),
         ),
     )
+    # 新检查点携带的合同对所有入口配置生效，旧配置名不能绕过身份校验。
+    from openpi.shared.ltmpi_contract import validate_checkpoint_contract
+
+    training_contract = validate_checkpoint_contract(checkpoint, config, manifest_path=args.memory_manifest)
     encoder_identity = resolve_checkpoint_identity(
         memory_encoder_checkpoint,
         explicit_sha256=None,
@@ -586,11 +609,23 @@ def main() -> None:
     encoder_key = (encoder_identity.format, encoder_identity.sha256)
     if encoder_key not in COMPATIBLE_ENCODER_IDENTITIES:
         raise ValueError(f"Unsupported DreamDojo encoder identity: {encoder_key}")
+    if training_contract is not None or config.name == STRIDE4_CONFIG:
+        # 新合同绑定具体编码器，不能借旧发行版的兼容白名单换用另一份权重。
+        manifest_encoder_key = (manifest["checkpoint_format"], manifest["checkpoint_sha256"])
+        config_encoder_sha256 = config.policy_metadata["memory_encoder_checkpoint_sha256"]
+        if encoder_key != manifest_encoder_key or encoder_identity.sha256 != config_encoder_sha256:
+            raise ValueError(
+                "运行时编码器与训练合同绑定的清单或配置不一致："
+                f"runtime={encoder_key}, manifest={manifest_encoder_key}, config_sha256={config_encoder_sha256}"
+            )
     preflight = {
         "status": "ok",
         "checkpoint": str(checkpoint),
         "config": args.config,
-        "memory_lag": args.memory_lag,
+        "memory_lag": memory_lag,
+        "transition_frame_stride": transition_frame_stride,
+        "training_contract_verified": training_contract is not None,
+        "models_loaded": False,
         "max_token_len": args.max_token_len,
         "memory_manifest": str(args.memory_manifest.resolve()),
         "memory_manifest_sha256": hashlib.sha256(args.memory_manifest.read_bytes()).hexdigest(),
@@ -631,7 +666,8 @@ def main() -> None:
         "memory_manifest_sha256": hashlib.sha256(args.memory_manifest.read_bytes()).hexdigest(),
         "memory_encoder_kind": memory_encoder_kind,
         "memory_encoder_checkpoint_sha256": encoder_identity.sha256,
-        "memory_lag": args.memory_lag,
+        "memory_lag": memory_lag,
+        "training_contract_verified": training_contract is not None,
         "memory_latent_storage_dtype": manifest["latent_dtype"],
         "rolling_memory": True,
         "memory_segment_embedding": config.model.memory_segment_embedding,
@@ -662,7 +698,7 @@ def main() -> None:
             use_execution_anchor=config.model.memory_execution_anchor,
             transition_frame_stride=transition_frame_stride,
             two_view_memory=two_view_memory,
-            memory_lag=args.memory_lag,
+            memory_lag=memory_lag,
             latent_storage_dtype=str(manifest["latent_dtype"]),
         )
 
