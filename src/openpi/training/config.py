@@ -25,6 +25,7 @@ import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
+import openpi.shared.nnx_utils as nnx_utils
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
@@ -3557,6 +3558,25 @@ _CONFIGS.append(
             "memory_random_drop_execution_tail": "fixed_integer_3_per_sample",
             "memory_stride": 4,
             "memory_anchor_pool_grid": 4,
+        },
+    )
+)
+
+# 冻结版保留S4的数据与模型口径，仅固定共享视觉塔。
+_LTMPI_S4_CONFIG = next(
+    config for config in _CONFIGS
+    if config.name == "pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_h50_default"
+)
+_CONFIGS.append(
+    dataclasses.replace(
+        _LTMPI_S4_CONFIG,
+        name="pi05_robomme_16x100_dreamdojo_lmv_causal_fixedlag3_stride4_anchor4x4_frozen_siglip_h50_default",
+        freeze_filter=nnx_utils.PathRegex(r"PaliGemma/img/.*"),
+        policy_metadata={
+            **_LTMPI_S4_CONFIG.policy_metadata,
+            "frozen_siglip": True,
+            "frozen_siglip_parameter_dtype": "bfloat16",
+            "frozen_siglip_ema_policy": "copy_frozen",
         },
     )
 )
