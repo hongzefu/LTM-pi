@@ -23,7 +23,7 @@ faf5ee94f69fc3ba35d1db7949d452396b8d3d543c12fb03db1bfc00a5f9c8c1  ./bin/validate
 28990145d5c7cac18f600278464c7b5f155be6a5b585061143131d9bc548219b  ./configs/paths.env.example
 015b8ba05573f441d22e1402c3aa19a46b9c69bd6c5f3c509c3c785cf162c5d4  ./docs/data-contract.md
 3d15cb3dc5b16bb3f405b805d22d9fe75274312a43e1ed5654ce9e75acbee8c5  ./docs/inference-protocol.md
-81a644cbfe44691eac6ce0b0ec73123cd9476a679ca0985007bfd758c20dc5fc  ./pyproject.toml
+6e4a4b5dc34faf910f953630f81150f372dde4893fbce7ce067310d901c77cda  ./pyproject.toml
 6f9e323225b16981be9d090291987e661b2ea4d875460cf3822db5852c215440  ./requirements.txt
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  ./scripts/__init__.py
 448f7909307cc31c2910788e95680367dccd77f3edbf416d4c97300b6eac3d6f  ./scripts/build_anchor_cache.py
@@ -107,3 +107,4 @@ f87cf716aa00df35fd1f88a2c518af3f6302d681b80fb9eaee14f17ca114a0c3  ./tests/test_r
 74003616e1f58caa8f071969655d8c92d74498981c44ea7c5e7f78223da427f9  ./third_party/dreamdojo/runtime/external/lam/modules/blocks.py
 b555a1b7d003a721a70547badfb8b74255b983e466cb58fb671903903a3f53d2  ./third_party/dreamdojo/runtime/external/lam/modules/embeddings.py
 e5ebe59193e07bc217b0d51c81f4a07bb3f6eac6b94371009634aed71d40e85a  ./third_party/dreamdojo/runtime/external/lam/modules/lam.py
+ddb782c5b4b718b1c282318fe9867bc7151cfb5ed419c05d042d5b4b497593c8  ./uv.lock

@@ -3,7 +3,7 @@ name = "ltm-pi-robomme"
 version = "1.1.0"
 description = "Standalone LTM-Pi training and inference for RoboMME with DreamDojo memory"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"
 license = { file = "LICENSE" }
 dependencies = [
     "av==17.0.0",
@@ -30,6 +30,7 @@ dependencies = [
     "optax==0.2.4",
     "orbax-checkpoint==0.11.13",
     "pillow==11.2.1",
+    "pyarrow==20.0.0",
     "sentencepiece==0.2.0",
     "torch==2.7.1",
     "tqdm-loggable==0.2",
