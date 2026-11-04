@@ -1,9 +1,11 @@
 import dataclasses
 import functools
+import hashlib
 import json
 import logging
 import os
 import platform
+from pathlib import Path
 from typing import Any
 
 import etils.epath as epath
@@ -215,6 +217,120 @@ def _scale_gradients(grads, accumulation_steps: int):
 def _sum_gradients(accumulated_grads, grads):
     """Sum equal-structure sharded gradient trees."""
     return jax.tree.map(lambda accumulated, grad: accumulated + grad, accumulated_grads, grads)
+
+
+def _audit_array_digest(path: tuple, value: Any) -> str:
+    """逐叶取回和摘要，不持有完整参数树的主机副本。"""
+    array = np.asarray(jax.device_get(value))
+    digest = hashlib.sha256()
+    digest.update(json.dumps([list(path), list(array.shape), str(array.dtype)]).encode())
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _vision_audit_summary(params: nnx.State) -> dict:
+    leaves = params.filter(nnx_utils.PathRegex(r"PaliGemma/img/.*")).flat_state()
+    if not leaves:
+        raise ValueError("冻结审计没有匹配视觉参数")
+    hashes = {"/".join(map(str, path)): _audit_array_digest(path, leaf.value) for path, leaf in leaves.items()}
+    return {
+        "sha256": _ltmpi_contract.canonical_sha256(hashes),
+        "leaf_count": len(leaves),
+        "parameter_count": sum(leaf.value.size for leaf in leaves.values()),
+        "dtypes": sorted({str(leaf.value.dtype) for leaf in leaves.values()}),
+    }
+
+
+def _frozen_audit_snapshot(state: training_utils.TrainState, probe_paths: tuple[tuple, ...]) -> dict:
+    """只读当前训练态；优化器大数组只看路径和 dtype，不传回主机。"""
+    if state.ema_params is None:
+        raise ValueError("冻结审计要求启用 EMA")
+    optimizer_counts = {}
+    visual_numeric_paths = []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(state.opt_state)[0]:
+        components = tuple(_path_component(key) for key in path)
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.number):
+            if "img" in components:
+                visual_numeric_paths.append(jax.tree_util.keystr(path))
+            if "count" in components and leaf.shape == ():
+                optimizer_counts[jax.tree_util.keystr(path)] = int(jax.device_get(leaf))
+    flat_params = state.params.flat_state()
+    return {
+        "step": int(jax.device_get(state.step)),
+        "live_vision": _vision_audit_summary(state.params),
+        "ema_vision": _vision_audit_summary(state.ema_params),
+        "optimizer_vision_numeric_paths": visual_numeric_paths,
+        "optimizer_counts": optimizer_counts,
+        "nonvision_probes": {
+            "/".join(map(str, path)): _audit_array_digest(path, flat_params[path].value) for path in probe_paths
+        },
+    }
+
+
+class _FrozenSiglipAudit:
+    """显式短测开关：只在初始化和结束计算参数摘要，每步只读取两个标量。"""
+
+    def __init__(self, config: _config.TrainConfig, state: training_utils.TrainState, path: str, contract: dict | None):
+        vision_paths = set(state.params.filter(nnx_utils.PathRegex(r"PaliGemma/img/.*")).flat_state())
+        if set(state.params.filter(config.freeze_filter).flat_state()) != vision_paths:
+            raise ValueError("冻结集合必须精确等于 PaliGemma/img 子树")
+        candidates = state.params.filter(config.trainable_filter).flat_state()
+        self.probe_paths = tuple(sorted(candidates, key=lambda key: (candidates[key].value.size, key))[:16])
+        if not self.probe_paths or any(path in vision_paths for path in self.probe_paths):
+            raise ValueError("冻结审计缺少非视觉可训练参数")
+        self.path = path
+        self.report = {
+            "schema_version": 1,
+            "kind": "ltmpi_frozen_siglip_audit",
+            "config_name": config.name,
+            "contract_sha256": None if contract is None else contract["contract_sha256"],
+            "status": "INITIALIZED",
+            "expected_steps": config.num_train_steps,
+            "initial": _frozen_audit_snapshot(state, self.probe_paths),
+            "metrics_count": 0,
+            "metrics_finite": True,
+        }
+        _ltmpi_contract.write_json_atomic(self.path, self.report)
+
+    def observe(self, info: dict) -> None:
+        values = jax.device_get((info["loss"], info["grad_norm"]))
+        self.report["metrics_count"] += 1
+        self.report["metrics_finite"] &= all(np.isfinite(value).all().item() for value in values)
+        if not self.report["metrics_finite"]:
+            self.report["status"] = "FAIL"
+            _ltmpi_contract.write_json_atomic(self.path, self.report)
+            raise RuntimeError("冻结短测出现非有限 loss 或梯度范数")
+
+    def finish(self, state: training_utils.TrainState) -> None:
+        initial = self.report["initial"]
+        final = _frozen_audit_snapshot(state, self.probe_paths)
+        checks = {
+            "vision_unchanged": initial["live_vision"] == final["live_vision"],
+            "ema_vision_unchanged": initial["ema_vision"] == final["ema_vision"] == initial["live_vision"],
+            "vision_bfloat16": all(
+                snapshot[key]["dtypes"] == ["bfloat16"]
+                for snapshot in (initial, final) for key in ("live_vision", "ema_vision")
+            ),
+            "optimizer_vision_empty": all(
+                not snapshot["optimizer_vision_numeric_paths"] for snapshot in (initial, final)
+            ),
+            "nonvision_updated": initial["nonvision_probes"] != final["nonvision_probes"],
+            "optimizer_counts_match_step": all(
+                bool(snapshot["optimizer_counts"])
+                and all(count == snapshot["step"] for count in snapshot["optimizer_counts"].values())
+                for snapshot in (initial, final)
+            ),
+            "completed_expected_steps": initial["step"] == 0
+            and final["step"] == self.report["expected_steps"] == self.report["metrics_count"],
+            "metrics_finite": self.report["metrics_finite"],
+        }
+        self.report.update(final=final, checks=checks, status="PASS" if all(checks.values()) else "FAIL")
+        _ltmpi_contract.write_json_atomic(self.path, self.report)
+        if self.report["status"] != "PASS":
+            raise RuntimeError(f"冻结训练态审计失败：{checks}")
+        logging.info(
+            "LTMPI_FROZEN_STATE=PASS vision_unchanged=1 ema_vision_unchanged=1 vision_optimizer_leaves=0"
+        )
 
 
 def init_logging():
@@ -467,11 +583,25 @@ def _apply_gradients(
 
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
     if state.ema_decay is not None:
+        if config.name == _ltmpi_contract.FROZEN_S4_CONFIG_NAME:
+            # 冻结子树直接沿用旧 EMA，避免 BF16 的乘加舍入改变固定参数。
+            frozen_ema, active_ema = state.ema_params.split(config.freeze_filter, ...)
+            active_params = new_params.filter(nnx.Not(config.freeze_filter))
+            ema_params = nnx.State.merge(
+                frozen_ema,
+                jax.tree.map(
+                    lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new,
+                    active_ema,
+                    active_params,
+                ),
+            )
+        else:
+            ema_params = jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+            )
         new_state = dataclasses.replace(
             new_state,
-            ema_params=jax.tree.map(
-                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
-            ),
+            ema_params=ema_params,
         )
     return new_state, {
         "grad_norm": optax.global_norm(grads),
@@ -530,6 +660,12 @@ def _close_training_loader(data_iter, data_loader):
 def main(config: _config.TrainConfig):
     init_logging()
     logging.info(f"Running on: {platform.node()}")
+    frozen_audit_path = os.environ.get("LTMPI_FROZEN_AUDIT_REPORT", "").strip()
+    if frozen_audit_path:
+        if config.name != _ltmpi_contract.FROZEN_S4_CONFIG_NAME or config.resume or config.restore_checkpoint_dir:
+            raise ValueError("冻结审计仅允许新冻结配置从初始化开始运行")
+        if Path(frozen_audit_path).exists():
+            raise ValueError("冻结审计报告已存在，禁止覆盖旧证据")
     validate_memory_normalization_requirement(config)
     training_contract = _ltmpi_contract.prepare_training_contract(config)
     receipts_dir = getattr(config, "checkpoint_upload_receipts_dir", None) or None
@@ -635,6 +771,9 @@ def main(config: _config.TrainConfig):
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+    frozen_audit = (
+        _FrozenSiglipAudit(config, train_state, frozen_audit_path, training_contract) if frozen_audit_path else None
+    )
 
     if resuming:
         restore_manager = source_checkpoint_manager if source_checkpoint_manager is not None else checkpoint_manager
@@ -784,6 +923,8 @@ def main(config: _config.TrainConfig):
             stacked_microbatch_infos = common_utils.stack_forest(microbatch_infos)
             info = jax.tree.map(jnp.mean, stacked_microbatch_infos)
             info.update(optimizer_info)
+        if frozen_audit is not None:
+            frozen_audit.observe(info)
         infos.append(info)
         if step % config.log_interval == 0:
             stacked_infos = common_utils.stack_forest(infos)
@@ -859,6 +1000,8 @@ def main(config: _config.TrainConfig):
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()
+    if frozen_audit is not None:
+        frozen_audit.finish(train_state)
     if receipts_dir and checkpoint_manager.latest_step() is not None:
         try:
             _ltmpi_contract.wait_for_checkpoint_upload(
