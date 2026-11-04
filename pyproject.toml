@@ -17,6 +17,7 @@ dependencies = [
     "flax==0.10.2",
     "filelock==3.18.0",
     "fsspec==2025.3.0",
+    "gcsfs==2025.3.0",
     "gym-aloha==0.1.1",
     "imageio==2.37.0",
     "jax[cuda12]==0.5.3",
